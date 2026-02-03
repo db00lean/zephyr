@@ -1,0 +1,10 @@
+/*
+ * Overlay for Silicon Labs xG24 radio board (OpenThread shell)
+ * Addresses console not coming up: settings partition and stack size
+ */
+
+/ {
+	chosen {
+		zephyr,settings-partition = &storage_partition;
+	};
+};

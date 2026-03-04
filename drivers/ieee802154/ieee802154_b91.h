@@ -14,7 +14,6 @@
 /* Received data parsing */
 #define B91_PAYLOAD_OFFSET                  (5)
 #define B91_PAYLOAD_MIN                     (5)
-#define B91_PAYLOAD_MAX                     (127)
 #define B91_FRAME_TYPE_OFFSET               (0)
 #define B91_FRAME_TYPE_MASK                 (0x07)
 #define B91_DEST_ADDR_TYPE_OFFSET           (1)
@@ -28,12 +27,9 @@
 #define B91_IEEE_ADDRESS_SIZE               (8)
 #define B91_LENGTH_OFFSET                   (4)
 #define B91_RSSI_OFFSET                     (11)
-#define B91_BROADCAST_ADDRESS               ((uint8_t [2]) { 0xff, 0xff })
-#define B91_ACK_FRAME_LEN                   (3)
 #define B91_ACK_TYPE                        (2)
 #define B91_ACK_REQUEST                     (1 << 5)
 #define B91_DSN_OFFSET                      (2)
-#define B91_FCS_LENGTH                      (2)
 
 /* Generic */
 #define B91_TRX_LENGTH                      (256)

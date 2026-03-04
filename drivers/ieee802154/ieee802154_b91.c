@@ -21,6 +21,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #include <zephyr/random/random.h>
 #include <zephyr/net/ieee802154_radio.h>
+#include <zephyr/net/ieee802154_frame.h>
 #include <zephyr/irq.h>
 #if defined(CONFIG_NET_L2_OPENTHREAD)
 #include <zephyr/net/openthread.h>
@@ -70,7 +71,7 @@ static bool b91_run_filter(uint8_t *rx_buffer)
 	/* Check destination PAN Id */
 	if (memcmp(&rx_buffer[B91_PAN_ID_OFFSET], data.filter_pan_id,
 		   B91_PAN_ID_SIZE) != 0 &&
-	    memcmp(&rx_buffer[B91_PAN_ID_OFFSET], B91_BROADCAST_ADDRESS,
+	    memcmp(&rx_buffer[B91_PAN_ID_OFFSET], IEEE802154_BROADCAST_PAN_ID,
 		   B91_PAN_ID_SIZE) != 0) {
 		return false;
 	}
@@ -80,7 +81,7 @@ static bool b91_run_filter(uint8_t *rx_buffer)
 	case B91_DEST_ADDR_TYPE_SHORT:
 		/* First check if the destination is broadcast */
 		/* If not broadcast, check if length and address matches */
-		if (memcmp(&rx_buffer[B91_DEST_ADDR_OFFSET], B91_BROADCAST_ADDRESS,
+		if (memcmp(&rx_buffer[B91_DEST_ADDR_OFFSET], IEEE802154_BROADCAST_ADDRESS,
 			   B91_SHORT_ADDRESS_SIZE) != 0 &&
 		    memcmp(&rx_buffer[B91_DEST_ADDR_OFFSET], data.filter_short_addr,
 			   B91_SHORT_ADDRESS_SIZE) != 0) {
@@ -211,7 +212,7 @@ static void b91_handle_ack(void)
 	struct net_pkt *ack_pkt;
 
 	/* allocate ack packet */
-	ack_pkt = net_pkt_rx_alloc_with_buffer(data.iface, B91_ACK_FRAME_LEN,
+	ack_pkt = net_pkt_rx_alloc_with_buffer(data.iface, IEEE802154_ACK_PKT_LENGTH,
 					       NET_AF_UNSPEC, 0, K_NO_WAIT);
 	if (!ack_pkt) {
 		LOG_ERR("No free packet available.");
@@ -220,7 +221,7 @@ static void b91_handle_ack(void)
 
 	/* update packet data */
 	if (net_pkt_write(ack_pkt, data.rx_buffer + B91_PAYLOAD_OFFSET,
-			  B91_ACK_FRAME_LEN) < 0) {
+			  IEEE802154_ACK_PKT_LENGTH) < 0) {
 		LOG_ERR("Failed to write to a packet.");
 		goto out;
 	}
@@ -275,11 +276,11 @@ static void b91_rf_rx_isr(void)
 		if (IS_ENABLED(CONFIG_IEEE802154_L2_PKT_INCL_FCS)) {
 			length = data.rx_buffer[B91_LENGTH_OFFSET];
 		} else {
-			length = data.rx_buffer[B91_LENGTH_OFFSET] - B91_FCS_LENGTH;
+			length = data.rx_buffer[B91_LENGTH_OFFSET] - IEEE802154_FCS_LENGTH;
 		}
 
 		/* check length */
-		if ((length < B91_PAYLOAD_MIN) || (length > B91_PAYLOAD_MAX)) {
+		if ((length < B91_PAYLOAD_MIN) || (length > IEEE802154_MAX_PHY_PACKET_SIZE)) {
 			LOG_ERR("Invalid length\n");
 			goto exit;
 		}
@@ -288,7 +289,7 @@ static void b91_rf_rx_isr(void)
 		payload = (uint8_t *)(data.rx_buffer + B91_PAYLOAD_OFFSET);
 
 		/* handle acknowledge packet if enabled */
-		if ((length == (B91_ACK_FRAME_LEN + B91_FCS_LENGTH)) &&
+		if ((length == (IEEE802154_ACK_PKT_LENGTH + IEEE802154_FCS_LENGTH)) &&
 		    ((payload[B91_FRAME_TYPE_OFFSET] & B91_FRAME_TYPE_MASK) == B91_ACK_TYPE)) {
 			if (data.ack_handler_en) {
 				b91_handle_ack();

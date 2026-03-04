@@ -23,6 +23,7 @@ LOG_MODULE_REGISTER(net_ieee802154, CONFIG_NET_L2_IEEE802154_LOG_LEVEL);
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_l2.h>
 #include <zephyr/net/net_linkaddr.h>
+#include <zephyr/net/ieee802154_frame.h>
 #include <zephyr/random/random.h>
 
 #ifdef CONFIG_NET_6LO
@@ -36,7 +37,6 @@ LOG_MODULE_REGISTER(net_ieee802154, CONFIG_NET_L2_IEEE802154_LOG_LEVEL);
 #endif /* CONFIG_NET_L2_IEEE802154_FRAGMENT */
 #endif /* CONFIG_NET_6LO */
 
-#include "ieee802154_frame.h"
 #include "ieee802154_mgmt_priv.h"
 #include "ieee802154_priv.h"
 #include "ieee802154_security.h"

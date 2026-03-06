@@ -137,10 +137,10 @@ static const struct ieee802154_mpdu *tx_mpdu = (struct ieee802154_mpdu *)silabs_
 static const struct ieee802154_mpdu *rx_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.rx_buffer;
 static const struct ieee802154_mpdu *enh_ack_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.enh_ack_buffer;
 
-static struct ieee802154_header_ie s_csl_header_ie = NULL;
+static struct ieee802154_header_ie s_csl_header_ie = { 0, };
 static uint16_t s_csl_ack_ie_short_addr;
 static uint8_t s_csl_ack_ie_ext_addr[IEEE802154_MAX_ADDR_LENGTH];
-static struct ieee802154_header_ie s_link_metrics_header_ie = NULL;
+static struct ieee802154_header_ie s_link_metrics_header_ie = { 0, };
 static uint16_t s_link_metrics_ack_ie_short_addr;
 static uint8_t s_link_metrics_ack_ie_ext_addr[IEEE802154_MAX_ADDR_LENGTH];
 
@@ -466,8 +466,7 @@ static uint8_t read_initial_packet_data(sl_rail_rx_packet_info_t *packet_info,
 	__ASSERT_NO_MSG(buffer_len >= expected_data_bytes_max);
 
 	// Read the packet info
-	sl_rail_status_t status = sl_rail_get_rx_incoming_packet_info(s_rail_handle, packet_info);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	__ASSERT_NO_MSG(sl_rail_get_rx_incoming_packet_info(s_rail_handle, packet_info) == SL_RAIL_STATUS_NO_ERROR);
 
 	// We are trying to get the packet info of a packet before it is completely received.
 	// We do this to evaluate the FP bit in response and add IEs to ACK if needed.
@@ -555,7 +554,7 @@ void handle_data_request_command(void)
 			}
 		}
     }
-    else if ((rx_mpdu->mhr.fc.frame_type != IEEE802154_FRAME_TYPE_DATA) || (initial_pkt_read_bytes <= pktOffset))
+    else if ((rx_mpdu->mhr.fs->fc.frame_type != IEEE802154_FRAME_TYPE_DATA) || (initial_pkt_read_bytes <= pktOffset))
     {
         status = sl_rail_ieee802154_toggle_frame_pending(s_rail_handle);
 		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
@@ -591,15 +590,19 @@ void handle_data_request_command(void)
 
 #if (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
 
-static bool rx_addr_matches_ack_ie(ieee802154_addressing_mode src_addr_mode, const ieee802154_address *addr, uint16_t ie_short_addr, const uint8_t *ie_ext_addr)
+static bool rx_addr_matches_ack_ie(enum ieee802154_addressing_mode src_addr_mode,
+				   const struct ieee802154_address *src_addr,
+				   uint16_t ie_short_addr, const uint8_t *ie_ext_addr)
 {
 	bool match = false;
 	switch (src_addr_mode) {
 		case IEEE802154_ADDR_MODE_SHORT:
-			match = (ie_short_addr < IEEE802154_NO_SHORT_ADDRESS_ASSIGNED && ie_short_addr == addr->short_addr);
+			match = (ie_short_addr < IEEE802154_NO_SHORT_ADDRESS_ASSIGNED &&
+				 ie_short_addr == src_addr->short_addr);
 			break;
 		case IEEE802154_ADDR_MODE_EXTENDED:
-			match = (memcmp(ie_ext_addr, addr->ext_addr, IEEE802154_MAX_ADDR_LENGTH) == 0);
+			match = (memcmp(ie_ext_addr, src_addr->ext_addr,
+					IEEE802154_MAX_ADDR_LENGTH) == 0);
 			break;
 		default:
 			break;
@@ -629,7 +632,7 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
 #define EARLY_FRAME_PENDING_EXPECTED_BYTES (2U + 2U + 1U + 2U + 8U + 2U + 8U + 14U)
 #define FINAL_PACKET_LENGTH_WITH_IE (EARLY_FRAME_PENDING_EXPECTED_BYTES + OT_ACK_IE_MAX_SIZE)
 
-	*initial_pkt_read_bytes = read_initial_packet_data(&packet_info_for_enh_ack, EARLY_FRAME_PENDING_EXPECTED_BYTES, PHY_HEADER_SIZE + 2, silabs_efr32_data.rx_buffer, FINAL_PACKET_LENGTH_WITH_IE);
+	*initial_pkt_read_bytes = read_initial_packet_data(packet_info_for_enh_ack, EARLY_FRAME_PENDING_EXPECTED_BYTES, PHY_HEADER_SIZE + 2, silabs_efr32_data.rx_buffer, FINAL_PACKET_LENGTH_WITH_IE);
 	if (*initial_pkt_read_bytes == 0U)
     {
         return true; // Nothing to read, which means generating an immediate ACK is also pointless
@@ -639,51 +642,48 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
     // We consider this while calculating the phase value below.
 	uint16_t recv_len = packet_info_for_enh_ack->p_first_portion_data[0];
 
-	if (rx_mpdu->mhr.fc.frame_version != IEEE802154_VERSION_802154)
+	if (rx_mpdu->mhr.fs->fc.frame_version != IEEE802154_VERSION_802154)
     {
         return false;
     }
 
-	ieee802154_addressing_mode src_addr_mode = rx_mpdu->mhr.fc.src_addr_mode;
-	ieee802154_address addr;
+	enum ieee802154_addressing_mode src_addr_mode = rx_mpdu->mhr.fs->fc.src_addr_mode;
+	const struct ieee802154_address *src_addr = NULL;
 	bool set_frame_pending = false;
 
 	// replaces sli_ot_radio_csl_src_addr_matches_peer
 	switch (src_addr_mode) {
 		case IEEE802154_ADDR_MODE_SHORT:
-			addr.short_addr = rx_mpdu->mhr.src_addr->plain.addr.short_addr;
+			src_addr = &rx_mpdu->mhr.src_addr->plain.addr;
 			break;
 		case IEEE802154_ADDR_MODE_EXTENDED:
-			memcpy(addr.ext_addr, rx_mpdu->mhr.src_addr->comp.addr.ext_addr, IEEE802154_MAX_ADDR_LENGTH);
+			src_addr = &rx_mpdu->mhr.src_addr->comp.addr;
 			break;
 		default:
+			__ASSERT_NO_MSG(false);
 			break;
 	}
 
-	if (silabs_efr32_data.is_src_match_enabled && src_addr_mode != IEEE802154_ADDR_MODE_NONE) {
-		set_frame_pending = (src_addr_mode == IEEE802154_ADDR_MODE_SHORT) ? src_match_short_contains(addr.short_addr) : src_match_ext_contains(addr.ext_addr);
+	if (silabs_efr32_data.is_src_match_enabled) {
+		set_frame_pending = (src_addr_mode == IEEE802154_ADDR_MODE_SHORT)
+			? src_match_short_contains(src_addr->short_addr)
+			: src_match_ext_contains(src_addr->ext_addr);
 	}
 
-	if (s_csl_header_ie != NULL) {
-		if (rx_addr_matches_ack_ie(src_addr_mode, &addr, s_csl_ack_ie_short_addr, s_csl_ack_ie_ext_addr)) {
+	if (s_csl_header_ie.length > 0) {
+		if (rx_addr_matches_ack_ie(src_addr_mode, src_addr,
+					   s_csl_ack_ie_short_addr, s_csl_ack_ie_ext_addr)) {
 			// TODO append CSL IE header to payload
 		}
 	}
-	if (s_link_metrics_header_ie != NULL) {
-		if (rx_addr_matches_ack_ie(src_addr_mode, &addr, s_link_metrics_ack_ie_short_addr, s_link_metrics_ack_ie_ext_addr)) {
+	if (s_link_metrics_header_ie.length > 0) {
+		if (rx_addr_matches_ack_ie(src_addr_mode, src_addr,
+					   s_link_metrics_ack_ie_short_addr,
+					   s_link_metrics_ack_ie_ext_addr)) {
 			// TODO append Link Metrics IE header to payload
-		}	
+		}
 	}
-
-#if OPENTHREAD_CONFIG_MLE_LINK_METRICS_SUBJECT_ENABLE
-	uint8_t linkMetricsData[IEEE802154_HEADER_IE_HEADER_LENGTH];
-	linkMetricsDataLen = otLinkMetricsEnhAckGenData(&aSrcAddress, sLastLqi, sLastRssi, linkMetricsData);
-
-    if (linkMetricsDataLen > 0)
-    {
-        dataPtr = linkMetricsData;
-    }
-#endif // OPENTHREAD_CONFIG_MLE_LINK_METRICS_SUBJECT_ENABLE
+	// TODO rest of this code
 }
 #endif // (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
 
@@ -816,15 +816,15 @@ static void handle_rx_pkt(void)
 	}
 
 	if (packet_details.is_ack) {
-		bool tx_is_data_request = (tx_mpdu->mhr.fc.frame_type == IEEE802154_FRAME_TYPE_MAC_COMMAND);
+		bool tx_is_data_request = (tx_mpdu->mhr.fs->fc.frame_type == IEEE802154_FRAME_TYPE_MAC_COMMAND);
 
-		if (rx_mpdu->mhr.fc.frame_type == IEEE802154_FRAME_TYPE_ACK &&
-		    tx_mpdu->mhr.fc.ar &&
-		    rx_mpdu->mhr.sequence == tx_mpdu->mhr.sequence) {
+		if (rx_mpdu->mhr.fs->fc.frame_type == IEEE802154_FRAME_TYPE_ACK &&
+		    tx_mpdu->mhr.fs->fc.ar &&
+		    rx_mpdu->mhr.fs->sequence == tx_mpdu->mhr.fs->sequence) {
 			handle_rx_ack(packet_length, &packet_details);
 			s_tx_errno = 0;
 			silabs_radio_state_clear_tx_data_and_wait_for_ack();
-			if (tx_is_data_request && rx_mpdu->mhr.fc.frame_pending) {
+			if (tx_is_data_request && rx_mpdu->mhr.fs->fc.frame_pending) {
 				s_em_pending_data = true;
 			}
 		}
@@ -859,7 +859,7 @@ static void handle_rx_pkt(void)
 			return;
 		}
 
-		if (rx_mpdu->mhr.fc.ar) {
+		if (rx_mpdu->mhr.fs->fc.ar) {
 			silabs_radio_state_set_tx_ack_ongoing(true);
 		} else if (s_em_pending_data) {
 			// We received a frame that does not require an ACK as result of a data
@@ -905,7 +905,7 @@ static void silabs_efr32_rail_events_callback(sl_rail_handle_t handle, sl_rail_e
 	/* Process TX events */
 	if ((events & SL_RAIL_EVENT_TX_PACKET_SENT) != 0ULL) {
 		if (silabs_radio_state_is_tx_data_ongoing()) {
-			if (tx_mpdu->mhr.fc.ar) {
+			if (tx_mpdu->mhr.fs->fc.ar) {
 				silabs_radio_state_set_waiting_for_ack(true);
 			} else {
 				silabs_radio_state_set_tx_data_ongoing(false);
@@ -1384,7 +1384,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
         .transaction_time = 0 // will be calculated later if DMP is used
     };
 
-	if (tx_mpdu->mhr.fc.ar) {
+	if (tx_mpdu->mhr.fs->fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
 		// time we wait for ACK
 		if(sl_rail_get_symbol_rate(s_rail_handle) > 0) {
@@ -1440,7 +1440,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	/* Block until RAIL events callback sets s_tx_errno and gives tx_wait. */
 	k_sem_take(&data->tx_wait, K_FOREVER);
 
-	if (tx_mpdu->mhr.fc.ar) {
+	if (tx_mpdu->mhr.fs->fc.ar) {
 		k_sem_take(&data->ack_wait, K_FOREVER);
 	}
 	(void)pkt;
@@ -1518,7 +1518,8 @@ static uint8_t silabs_efr32_get_acc(const struct device *dev)
 
 static void silabs_efr32_configure_enh_ack_probing(const struct ieee802154_config *config)
 {
-	uint8_t bytes = 0;
+	// TODO implement
+	return;
 }
 
 

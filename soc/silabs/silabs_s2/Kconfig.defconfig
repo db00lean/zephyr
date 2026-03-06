@@ -60,4 +60,7 @@ configdefault BT_LONG_WQ_STACK_SIZE
 	default 1600 if BT_ECC
 endif
 
+configdefault SILABS_SISDK_RAIL_MULTIPROTOCOL
+	default y if BT_SILABS_EFR32 && IEEE802154_SILABS_EFR32
+
 endif

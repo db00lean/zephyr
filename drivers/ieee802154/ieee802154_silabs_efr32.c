@@ -38,6 +38,9 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #include <zephyr/devicetree.h>
 #include <zephyr/net/ieee802154_radio.h>
+#include <zephyr/net/ieee802154_ie.h>
+#include <zephyr/net/ieee802154.h>
+#include <zephyr/net/ptp_time.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
@@ -130,6 +133,17 @@ static struct ieee802154_key s_sec_keys[SILABS_SEC_KEY_SLOTS];
 /* Driver data; defined here so the events callback can reference it. */
 static struct silabs_efr32_802154_data silabs_efr32_data;
 
+static const struct ieee802154_mpdu *tx_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.tx_buffer;
+static const struct ieee802154_mpdu *rx_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.rx_buffer;
+static const struct ieee802154_mpdu *enh_ack_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.enh_ack_buffer;
+
+static struct ieee802154_header_ie s_csl_header_ie = NULL;
+static uint16_t s_csl_ack_ie_short_addr;
+static uint8_t s_csl_ack_ie_ext_addr[IEEE802154_MAX_ADDR_LENGTH];
+static struct ieee802154_header_ie s_link_metrics_header_ie = NULL;
+static uint16_t s_link_metrics_ack_ie_short_addr;
+static uint8_t s_link_metrics_ack_ie_ext_addr[IEEE802154_MAX_ADDR_LENGTH];
+
 static bool src_match_short_contains(uint16_t short_addr);
 static bool src_match_ext_contains(const uint8_t *addr);
 
@@ -139,6 +153,9 @@ static bool src_match_ext_contains(const uint8_t *addr);
 #define SL_MAX_CHANNELS_SUPPORTED ((OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MAX - OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN) + 1)
 
 void sl_openthread_init(void);
+
+// Forward declaration for silabs_efr32_get_time
+static net_time_t silabs_efr32_get_time(const struct device *dev);
 
 /*************************************************************************************************************************/
 /// Radio Energy Scan
@@ -194,17 +211,8 @@ bool sli_ot_energy_scan_is_in_progress(void)
 #define RADIO_TIMING_DEFAULT_BYTETIME_US 32   // only used if sl_rail_get_bit_rate returns 0
 #define RADIO_TIMING_DEFAULT_SYMBOLTIME_US 16 // only used if sl_rail_get_symbol_rate returns 0
 #define CCA_THRESHOLD_DEFAULT -75 // dBm - default for 2.4GHz 802.15.4
-
-/* IEEE 802.15.4 FCF: ACK request is bit 5 of first FCF byte (MPDU byte 0 = tx_psdu[1]) */
-#define SILABS_EFR32_FCF_ACK_REQUEST  BIT(5)
-/* Frame type is bits 0..2 of first FCF byte (SiSDK: IEEE802154_FRAME_TYPE_MASK / _ACK / _DATA) */
-#define SILABS_EFR32_FCF_FRAME_TYPE_MASK     ((uint16_t)0x0007U)
-#define SILABS_EFR32_FCF_FRAME_TYPE_COMMAND  ((uint16_t)0x0003U)
-#define SILABS_EFR32_FCF_FRAME_TYPE_ACK      ((uint16_t)0x0002U)
-#define SILABS_EFR32_FCF_FRAME_TYPE_DATA     ((uint16_t)0x0001U)
-/* DSN (Data Sequence Number) is first byte after 2-byte FCF in MPDU (SiSDK: IEEE802154_DSN_OFFSET) */
-#define SILABS_EFR32_DSN_OFFSET  (2U)
-#define SILABS_EFR32_FCF_OFFSET  (0U)
+#define SHR_DURATION_US 160
+#define SCHEDULE_TX_DELAY_US 3000
 
 #define SILABS_RADIO_FLAG_NONE                 BIT(0)
 #define SILABS_RADIO_FLAG_ONGOING_TX_DATA      BIT(1)
@@ -455,23 +463,16 @@ static uint8_t read_initial_packet_data(sl_rail_rx_packet_info_t *packet_info,
 	uint8_t                   buffer_len)
 {
 	// Check if we have enough buffer
-	if (buffer_len < expected_data_bytes_max) {
-		// TODO handle assertion failure
-		return 0;
-	}
+	__ASSERT_NO_MSG(buffer_len >= expected_data_bytes_max);
 
 	// Read the packet info
 	sl_rail_status_t status = sl_rail_get_rx_incoming_packet_info(s_rail_handle, packet_info);
-	if (status != SL_RAIL_STATUS_NO_ERROR) {
-		// TODO handle assertion failure
-		return 0;
-	}
+	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
 
 	// We are trying to get the packet info of a packet before it is completely received.
 	// We do this to evaluate the FP bit in response and add IEs to ACK if needed.
 	// Check to see if we have received atleast minimum number of bytes requested.
 	if (packet_info->packet_bytes < expected_data_bytes_min) {
-		// TODO handle assertion failure
 		return 0;
 	}
 
@@ -513,7 +514,7 @@ void handle_data_request_command(void)
     // kind of ACK is being requested -- Immediate or Enhanced.
 
 
-    uint8_t initial_pkt_read_bytes = read_initial_packet_data(&packet_info, MAX_EXPECTED_BYTES, pktOffset + 2, silabs_efr32_data.rx_psdu, MAX_EXPECTED_BYTES);
+    uint8_t initial_pkt_read_bytes;
 
 #if (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
 	uint32_t                 rxCallbackTimestamp = sl_rail_get_time(s_rail_handle);
@@ -523,14 +524,13 @@ void handle_data_request_command(void)
         // generating an enhanced ACK.
         return;
     }
+#else
+	initial_pkt_read_bytes = read_initial_packet_data(&packet_info, MAX_EXPECTED_BYTES, pktOffset + 2, silabs_efr32_data.rx_buffer, MAX_EXPECTED_BYTES);
 #endif
 
     // Calculate frame pending for immediate-ACK
     // If not, RAIL will send an immediate ACK, but we need to do FP lookup.
     sl_rail_status_t status = SL_RAIL_STATUS_NO_ERROR;
-
-    // Check if we read the FCF, if not, set mac_fcf to 0
-    uint16_t mac_fcf = (initial_pkt_read_bytes <= pktOffset) ? 0U : silabs_efr32_data.rx_psdu[pktOffset];
 
     bool frame_pending_set = false;
 
@@ -549,22 +549,16 @@ void handle_data_request_command(void)
 				}
 				if (match) {
 					status = sl_rail_ieee802154_toggle_frame_pending(s_rail_handle);
-					if (status != SL_RAIL_STATUS_NO_ERROR) {
-						// TODO handle assertion failure
-						return;
-					}
+					__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
 					frame_pending_set = true;
 				}
 			}
 		}
     }
-    else if ((mac_fcf & SILABS_EFR32_FCF_FRAME_TYPE_MASK) != SILABS_EFR32_FCF_FRAME_TYPE_DATA)
+    else if ((rx_mpdu->mhr.fc.frame_type != IEEE802154_FRAME_TYPE_DATA) || (initial_pkt_read_bytes <= pktOffset))
     {
         status = sl_rail_ieee802154_toggle_frame_pending(s_rail_handle);
-		if (status != SL_RAIL_STATUS_NO_ERROR) {
-			// TODO handle assertion failure
-			return;
-		}
+		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
 		frame_pending_set = true;
     }
 
@@ -596,6 +590,23 @@ void handle_data_request_command(void)
 }
 
 #if (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
+
+static bool rx_addr_matches_ack_ie(ieee802154_addressing_mode src_addr_mode, const ieee802154_address *addr, uint16_t ie_short_addr, const uint8_t *ie_ext_addr)
+{
+	bool match = false;
+	switch (src_addr_mode) {
+		case IEEE802154_ADDR_MODE_SHORT:
+			match = (ie_short_addr < IEEE802154_NO_SHORT_ADDRESS_ASSIGNED && ie_short_addr == addr->short_addr);
+			break;
+		case IEEE802154_ADDR_MODE_EXTENDED:
+			match = (memcmp(ie_ext_addr, addr->ext_addr, IEEE802154_MAX_ADDR_LENGTH) == 0);
+			break;
+		default:
+			break;
+	}
+	return match;
+}
+
 //------------------------------------------------------------------------------
 // Radio implementation: Enhanced ACKs, CSL
 
@@ -605,8 +616,74 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
                                        uint32_t                  rxTimestamp,
                                        uint8_t                  *initial_pkt_read_bytes)
 {
-	// TODO implement
-	return false;
+	// RAIL will generate an Immediate ACK for us.
+    // For an Enhanced ACK, we need to generate the whole packet ourselves.
+
+    // An 802.15.4 packet from RAIL should look like:
+    // 1/2 |   1/2  | 0/1  |  0/2   | 0/2/8  |  0/2   | 0/2/8  |   14
+    // PHR | MacFCF | Seq# | DstPan | DstAdr | SrcPan | SrcAdr | SecHdr
+
+    // With sl_rail_ieee802154_enable_early_frame_pending(), SL_RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND
+    // is triggered after receiving through the SrcAdr field of Version 0/1 packets,
+    // and after receiving through the SecHdr for Version 2 packets.
+#define EARLY_FRAME_PENDING_EXPECTED_BYTES (2U + 2U + 1U + 2U + 8U + 2U + 8U + 14U)
+#define FINAL_PACKET_LENGTH_WITH_IE (EARLY_FRAME_PENDING_EXPECTED_BYTES + OT_ACK_IE_MAX_SIZE)
+
+	*initial_pkt_read_bytes = read_initial_packet_data(&packet_info_for_enh_ack, EARLY_FRAME_PENDING_EXPECTED_BYTES, PHY_HEADER_SIZE + 2, silabs_efr32_data.rx_buffer, FINAL_PACKET_LENGTH_WITH_IE);
+	if (*initial_pkt_read_bytes == 0U)
+    {
+        return true; // Nothing to read, which means generating an immediate ACK is also pointless
+    }
+
+	// This should be set to the expected length of the packet is being received.
+    // We consider this while calculating the phase value below.
+	uint16_t recv_len = packet_info_for_enh_ack->p_first_portion_data[0];
+
+	if (rx_mpdu->mhr.fc.frame_version != IEEE802154_VERSION_802154)
+    {
+        return false;
+    }
+
+	ieee802154_addressing_mode src_addr_mode = rx_mpdu->mhr.fc.src_addr_mode;
+	ieee802154_address addr;
+	bool set_frame_pending = false;
+
+	// replaces sli_ot_radio_csl_src_addr_matches_peer
+	switch (src_addr_mode) {
+		case IEEE802154_ADDR_MODE_SHORT:
+			addr.short_addr = rx_mpdu->mhr.src_addr->plain.addr.short_addr;
+			break;
+		case IEEE802154_ADDR_MODE_EXTENDED:
+			memcpy(addr.ext_addr, rx_mpdu->mhr.src_addr->comp.addr.ext_addr, IEEE802154_MAX_ADDR_LENGTH);
+			break;
+		default:
+			break;
+	}
+
+	if (silabs_efr32_data.is_src_match_enabled && src_addr_mode != IEEE802154_ADDR_MODE_NONE) {
+		set_frame_pending = (src_addr_mode == IEEE802154_ADDR_MODE_SHORT) ? src_match_short_contains(addr.short_addr) : src_match_ext_contains(addr.ext_addr);
+	}
+
+	if (s_csl_header_ie != NULL) {
+		if (rx_addr_matches_ack_ie(src_addr_mode, &addr, s_csl_ack_ie_short_addr, s_csl_ack_ie_ext_addr)) {
+			// TODO append CSL IE header to payload
+		}
+	}
+	if (s_link_metrics_header_ie != NULL) {
+		if (rx_addr_matches_ack_ie(src_addr_mode, &addr, s_link_metrics_ack_ie_short_addr, s_link_metrics_ack_ie_ext_addr)) {
+			// TODO append Link Metrics IE header to payload
+		}	
+	}
+
+#if OPENTHREAD_CONFIG_MLE_LINK_METRICS_SUBJECT_ENABLE
+	uint8_t linkMetricsData[IEEE802154_HEADER_IE_HEADER_LENGTH];
+	linkMetricsDataLen = otLinkMetricsEnhAckGenData(&aSrcAddress, sLastLqi, sLastRssi, linkMetricsData);
+
+    if (linkMetricsDataLen > 0)
+    {
+        dataPtr = linkMetricsData;
+    }
+#endif // OPENTHREAD_CONFIG_MLE_LINK_METRICS_SUBJECT_ENABLE
 }
 #endif // (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
 
@@ -646,7 +723,7 @@ static void handle_rx_ack(uint16_t length, sl_rail_rx_packet_details_t *packet_d
 	}
 
 	/* update packet data */
-	if (net_pkt_write(ack_pkt, silabs_efr32_data.rx_psdu, length) < 0) {
+	if (net_pkt_write(ack_pkt, silabs_efr32_data.rx_buffer, length) < 0) {
   		LOG_ERR("Failed to write to a packet.");
   		goto out;
 	}
@@ -699,7 +776,6 @@ static void handle_rx_pkt(void)
 	sl_rail_rx_packet_details_t packet_details;
 	sl_rail_rx_packet_handle_t packet_handle;
 	uint16_t packet_length;
-	uint8_t mac_fcf;
 
 	packet_handle = sl_rail_get_rx_packet_info(s_rail_handle, SL_RAIL_RX_PACKET_HANDLE_NEWEST, &packet_info);
 	if (packet_handle == SL_RAIL_RX_PACKET_HANDLE_INVALID ||
@@ -733,31 +809,26 @@ static void handle_rx_pkt(void)
 		return;
 	}
 
-	sl_rail_status_t status = sl_rail_copy_rx_packet(s_rail_handle, silabs_efr32_data.rx_psdu, &packet_info);
+	sl_rail_status_t status = sl_rail_copy_rx_packet(s_rail_handle, silabs_efr32_data.rx_buffer, &packet_info);
 
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
 		return;
 	}
 
-	mac_fcf = silabs_efr32_data.rx_psdu[0]; /* first FCF byte */
-
 	if (packet_details.is_ack) {
-		uint16_t tx_fcf = (uint16_t)silabs_efr32_data.tx_psdu[SILABS_EFR32_FCF_OFFSET] |
-				  (uint16_t)(silabs_efr32_data.tx_psdu[SILABS_EFR32_FCF_OFFSET + 1] << 8);
-		bool is_data_request = ((tx_fcf & SILABS_EFR32_FCF_FRAME_TYPE_MASK) ==
-				       SILABS_EFR32_FCF_FRAME_TYPE_COMMAND);
+		bool tx_is_data_request = (tx_mpdu->mhr.fc.frame_type == IEEE802154_FRAME_TYPE_MAC_COMMAND);
 
-		if ((mac_fcf & SILABS_EFR32_FCF_FRAME_TYPE_MASK) == SILABS_EFR32_FCF_FRAME_TYPE_ACK &&
-		    ((silabs_efr32_data.tx_psdu[1] & SILABS_EFR32_FCF_ACK_REQUEST) != 0U) &&
-		    silabs_efr32_data.rx_psdu[SILABS_EFR32_DSN_OFFSET] == silabs_efr32_data.tx_psdu[SILABS_EFR32_DSN_OFFSET]) {
+		if (rx_mpdu->mhr.fc.frame_type == IEEE802154_FRAME_TYPE_ACK &&
+		    tx_mpdu->mhr.fc.ar &&
+		    rx_mpdu->mhr.sequence == tx_mpdu->mhr.sequence) {
 			handle_rx_ack(packet_length, &packet_details);
 			s_tx_errno = 0;
 			silabs_radio_state_clear_tx_data_and_wait_for_ack();
-			if (is_data_request && (mac_fcf & SILABS_EFR32_FCF_FRAME_PENDING) != 0) {
+			if (tx_is_data_request && rx_mpdu->mhr.fc.frame_pending) {
 				s_em_pending_data = true;
 			}
 		}
-		if (!is_data_request) {
+		if (!tx_is_data_request) {
 			yield_radio();
 		}
 	} else {
@@ -771,7 +842,7 @@ static void handle_rx_pkt(void)
 			LOG_ERR("No pkt available");
 			return;
 		}
-		if (net_pkt_write(pkt, silabs_efr32_data.rx_psdu, packet_length) < 0) {
+		if (net_pkt_write(pkt, silabs_efr32_data.rx_buffer, packet_length) < 0) {
 			LOG_ERR("Failed to write to a packet.");
 			net_pkt_unref(pkt);
 			return;
@@ -788,7 +859,7 @@ static void handle_rx_pkt(void)
 			return;
 		}
 
-		if (mac_fcf & SILABS_EFR32_FCF_ACK_REQUIRED) {
+		if (rx_mpdu->mhr.fc.ar) {
 			silabs_radio_state_set_tx_ack_ongoing(true);
 		} else if (s_em_pending_data) {
 			// We received a frame that does not require an ACK as result of a data
@@ -834,7 +905,7 @@ static void silabs_efr32_rail_events_callback(sl_rail_handle_t handle, sl_rail_e
 	/* Process TX events */
 	if ((events & SL_RAIL_EVENT_TX_PACKET_SENT) != 0ULL) {
 		if (silabs_radio_state_is_tx_data_ongoing()) {
-			if ((silabs_efr32_data.tx_psdu[1] & SILABS_EFR32_FCF_ACK_REQUEST) != 0U) {
+			if (tx_mpdu->mhr.fc.ar) {
 				silabs_radio_state_set_waiting_for_ack(true);
 			} else {
 				silabs_radio_state_set_tx_data_ongoing(false);
@@ -1265,8 +1336,6 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 			   struct net_pkt *pkt, struct net_buf *frag)
 {
 	struct silabs_efr32_802154_data *data = SILABS_EFR32_802154_DATA(dev);
-	uint8_t len;
-	const uint8_t *payload;
 
 	if (!s_rail_initialized) {
 		return -ENOTSUP;
@@ -1274,7 +1343,21 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 
 	idle_radio();
 
-	__ASSERT_NO_MSG(silabs_radio_state_is_tx_data_ongoing() == false);
+	__ASSERT_NO_MSG(!silabs_radio_state_is_tx_data_ongoing());
+
+#if defined(CONFIG_OPENTHREAD_PLATFORM_PKT_TXTIME)
+
+	struct net_ptp_time *tx_time = net_pkt_timestamp(pkt);
+	if (data->csl_period > 0 && (tx_time->second == 0 && tx_time->nanosecond == 0)) {
+		// Only called for CSL children (CSL period > 0)
+		// Note: Our SSEDs "schedule" transmissions to their parent in order to know
+		// exactly when in the future the data packets go out so they can calculate
+		// the accurate CSL phase to send to their parent.
+		net_pkt_set_timestamp_ns(pkt, silabs_efr32_get_time(dev) + (SCHEDULE_TX_DELAY_US + SHR_DURATION_US) * NSEC_PER_USEC);
+	}
+#endif // CONFIG_OPENTHREAD_PLATFORM_PKT_TXTIME
+
+	// TODO update frame IE
 
 	// TODO sli_ot_radio_security_process_transmit
 
@@ -1282,17 +1365,15 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 
 	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
 
-	payload = frag->data;
-	len = (uint8_t)frag->len;
-	if (len > sizeof(data->tx_psdu) - 1) {
+	uint8_t len = (uint8_t)frag->len + 2U; // Add CRC byte length (2 bytes)
+	if (frag->len > IEEE802154_MTU) {
 		return -EMSGSIZE;
 	}
+	memcpy(&data->tx_buffer, frag->data, len);
 
 	/* PHR (first byte) = length; then MPDU */
-	data->tx_psdu[0] = len + 2U; /* FCS */
-	memcpy(&data->tx_psdu[1], payload, len);
-
-	(void)sl_rail_write_tx_fifo(s_rail_handle, data->tx_psdu, (len + 2U + 1U), true);
+	(void)sl_rail_write_tx_fifo(s_rail_handle, &len, sizeof(len), true);
+	(void)sl_rail_write_tx_fifo(s_rail_handle, data->tx_buffer, len, false);
 	k_sem_reset(&data->tx_wait);
 	k_sem_reset(&data->ack_wait);
 	s_tx_errno = -EIO; /* default if no event fires */
@@ -1303,7 +1384,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
         .transaction_time = 0 // will be calculated later if DMP is used
     };
 
-	if (payload[0] & SILABS_EFR32_FCF_ACK_REQUEST) {
+	if (tx_mpdu->mhr.fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
 		// time we wait for ACK
 		if(sl_rail_get_symbol_rate(s_rail_handle) > 0) {
@@ -1359,7 +1440,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	/* Block until RAIL events callback sets s_tx_errno and gives tx_wait. */
 	k_sem_take(&data->tx_wait, K_FOREVER);
 
-	if ((silabs_efr32_data.tx_psdu[1] & SILABS_EFR32_FCF_ACK_REQUEST) != 0U) {
+	if (tx_mpdu->mhr.fc.ar) {
 		k_sem_take(&data->ack_wait, K_FOREVER);
 	}
 	(void)pkt;
@@ -1434,6 +1515,12 @@ static uint8_t silabs_efr32_get_acc(const struct device *dev)
 	 */
 	return (uint8_t)SILABS_EFR32_SCH_ACCURACY_PPM;
 }
+
+static void silabs_efr32_configure_enh_ack_probing(const struct ieee802154_config *config)
+{
+	uint8_t bytes = 0;
+}
+
 
 static int silabs_efr32_configure(const struct device *dev,
 				   enum ieee802154_config_type type,
@@ -1562,7 +1649,8 @@ static int silabs_efr32_configure(const struct device *dev,
 		return 0;
 
 	case IEEE802154_CONFIG_ENH_ACK_HEADER_IE:
-		return -ENOTSUP;
+		silabs_efr32_configure_enh_ack_probing(config);
+		return 0;
 
 	default:
 		return -ENOTSUP;
@@ -1679,7 +1767,7 @@ static int silabs_efr32_init(const struct device *dev)
 
 		__ASSERT_NO_MSG(sl_rail_util_pa_post_init(s_rail_handle, SL_RAIL_TX_PA_MODE_2P4_GHZ) == SL_RAIL_STATUS_NO_ERROR);
 
-		__ASSERT_NO_MSG(silabs_efr32_set_txpower(silabs_efr32_get_device(), (sl_rail_tx_power_t)OPENTHREAD_CONFIG_DEFAULT_TRANSMIT_POWER) == 0);
+		__ASSERT_NO_MSG(silabs_efr32_set_txpower(dev, (sl_rail_tx_power_t)OPENTHREAD_CONFIG_DEFAULT_TRANSMIT_POWER) == 0);
 
 		s_rail_initialized = true;
 
@@ -1687,7 +1775,7 @@ static int silabs_efr32_init(const struct device *dev)
 		status = sl_rail_config_sleep(s_rail_handle, &timer_sync_config);
 		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
 		
-		memset(data->tx_psdu, 0, sizeof(data->tx_psdu));
+		memset(data->tx_buffer, 0, sizeof(data->tx_buffer));
 
 		// ignoring OPENTHREAD_CONFIG_MLE_LINK_METRICS_SUBJECT_ENABLE
 

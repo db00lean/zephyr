@@ -12,9 +12,13 @@
  */
 
 #include <zephyr/logging/log.h>
+#if defined(CONFIG_NET_L2_IEEE802154_LOG_LEVEL)
 LOG_MODULE_REGISTER(net_ieee802154_frame, CONFIG_NET_L2_IEEE802154_LOG_LEVEL);
+#else
+LOG_MODULE_REGISTER(net_ieee802154_frame, LOG_LEVEL_NONE);
+#endif
 
-#include "ieee802154_frame.h"
+#include <zephyr/net/ieee802154_frame.h>
 #include "ieee802154_security.h"
 
 #include <zephyr/net/net_core.h>

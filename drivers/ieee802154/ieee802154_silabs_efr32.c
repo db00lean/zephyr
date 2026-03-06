@@ -133,9 +133,10 @@ static struct ieee802154_key s_sec_keys[SILABS_SEC_KEY_SLOTS];
 /* Driver data; defined here so the events callback can reference it. */
 static struct silabs_efr32_802154_data silabs_efr32_data;
 
-static const struct ieee802154_mpdu *tx_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.tx_buffer;
-static const struct ieee802154_mpdu *rx_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.rx_buffer;
-static const struct ieee802154_mpdu *enh_ack_mpdu = (struct ieee802154_mpdu *)silabs_efr32_data.enh_ack_buffer;
+/* Parsed MPDU structures - populated by ieee802154_validate_frame() after buffer fills */
+static struct ieee802154_mpdu tx_mpdu;
+static struct ieee802154_mpdu rx_mpdu;
+static struct ieee802154_mpdu enh_ack_mpdu;
 
 static struct ieee802154_header_ie s_csl_header_ie = { 0, };
 static uint16_t s_csl_ack_ie_short_addr;
@@ -525,6 +526,9 @@ void handle_data_request_command(void)
     }
 #else
 	initial_pkt_read_bytes = read_initial_packet_data(&packet_info, MAX_EXPECTED_BYTES, pktOffset + 2, silabs_efr32_data.rx_buffer, MAX_EXPECTED_BYTES);
+	if (initial_pkt_read_bytes >= IEEE802154_MIN_LENGTH) {
+		(void)ieee802154_validate_frame(silabs_efr32_data.rx_buffer, initial_pkt_read_bytes, &rx_mpdu);
+	}
 #endif
 
     // Calculate frame pending for immediate-ACK
@@ -554,7 +558,7 @@ void handle_data_request_command(void)
 			}
 		}
     }
-    else if ((rx_mpdu->mhr.fs->fc.frame_type != IEEE802154_FRAME_TYPE_DATA) || (initial_pkt_read_bytes <= pktOffset))
+    else if ((rx_mpdu.mhr.fs->fc.frame_type != IEEE802154_FRAME_TYPE_DATA) || (initial_pkt_read_bytes <= pktOffset))
     {
         status = sl_rail_ieee802154_toggle_frame_pending(s_rail_handle);
 		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
@@ -638,26 +642,30 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
         return true; // Nothing to read, which means generating an immediate ACK is also pointless
     }
 
+	if (!ieee802154_validate_frame(silabs_efr32_data.rx_buffer, *initial_pkt_read_bytes, &rx_mpdu)) {
+		return true;
+	}
+
 	// This should be set to the expected length of the packet is being received.
     // We consider this while calculating the phase value below.
 	uint16_t recv_len = packet_info_for_enh_ack->p_first_portion_data[0];
 
-	if (rx_mpdu->mhr.fs->fc.frame_version != IEEE802154_VERSION_802154)
+	if (rx_mpdu.mhr.fs->fc.frame_version != IEEE802154_VERSION_802154)
     {
         return false;
     }
 
-	enum ieee802154_addressing_mode src_addr_mode = rx_mpdu->mhr.fs->fc.src_addr_mode;
+	enum ieee802154_addressing_mode src_addr_mode = rx_mpdu.mhr.fs->fc.src_addr_mode;
 	const struct ieee802154_address *src_addr = NULL;
 	bool set_frame_pending = false;
 
 	// replaces sli_ot_radio_csl_src_addr_matches_peer
 	switch (src_addr_mode) {
 		case IEEE802154_ADDR_MODE_SHORT:
-			src_addr = &rx_mpdu->mhr.src_addr->plain.addr;
+			src_addr = &rx_mpdu.mhr.src_addr->plain.addr;
 			break;
 		case IEEE802154_ADDR_MODE_EXTENDED:
-			src_addr = &rx_mpdu->mhr.src_addr->comp.addr;
+			src_addr = &rx_mpdu.mhr.src_addr->comp.addr;
 			break;
 		default:
 			__ASSERT_NO_MSG(false);
@@ -815,16 +823,20 @@ static void handle_rx_pkt(void)
 		return;
 	}
 
-	if (packet_details.is_ack) {
-		bool tx_is_data_request = (tx_mpdu->mhr.fs->fc.frame_type == IEEE802154_FRAME_TYPE_MAC_COMMAND);
+	if (!ieee802154_validate_frame(silabs_efr32_data.rx_buffer, packet_length, &rx_mpdu)) {
+		return;
+	}
 
-		if (rx_mpdu->mhr.fs->fc.frame_type == IEEE802154_FRAME_TYPE_ACK &&
-		    tx_mpdu->mhr.fs->fc.ar &&
-		    rx_mpdu->mhr.fs->sequence == tx_mpdu->mhr.fs->sequence) {
+	if (packet_details.is_ack) {
+		bool tx_is_data_request = (tx_mpdu.mhr.fs->fc.frame_type == IEEE802154_FRAME_TYPE_MAC_COMMAND);
+
+		if (rx_mpdu.mhr.fs->fc.frame_type == IEEE802154_FRAME_TYPE_ACK &&
+		    tx_mpdu.mhr.fs->fc.ar &&
+		    rx_mpdu.mhr.fs->sequence == tx_mpdu.mhr.fs->sequence) {
 			handle_rx_ack(packet_length, &packet_details);
 			s_tx_errno = 0;
 			silabs_radio_state_clear_tx_data_and_wait_for_ack();
-			if (tx_is_data_request && rx_mpdu->mhr.fs->fc.frame_pending) {
+			if (tx_is_data_request && rx_mpdu.mhr.fs->fc.frame_pending) {
 				s_em_pending_data = true;
 			}
 		}
@@ -859,7 +871,7 @@ static void handle_rx_pkt(void)
 			return;
 		}
 
-		if (rx_mpdu->mhr.fs->fc.ar) {
+		if (rx_mpdu.mhr.fs->fc.ar) {
 			silabs_radio_state_set_tx_ack_ongoing(true);
 		} else if (s_em_pending_data) {
 			// We received a frame that does not require an ACK as result of a data
@@ -905,7 +917,7 @@ static void silabs_efr32_rail_events_callback(sl_rail_handle_t handle, sl_rail_e
 	/* Process TX events */
 	if ((events & SL_RAIL_EVENT_TX_PACKET_SENT) != 0ULL) {
 		if (silabs_radio_state_is_tx_data_ongoing()) {
-			if (tx_mpdu->mhr.fs->fc.ar) {
+			if (tx_mpdu.mhr.fs->fc.ar) {
 				silabs_radio_state_set_waiting_for_ack(true);
 			} else {
 				silabs_radio_state_set_tx_data_ongoing(false);
@@ -1371,6 +1383,10 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	}
 	memcpy(&data->tx_buffer, frag->data, len);
 
+	if (!ieee802154_validate_frame(data->tx_buffer, len, &tx_mpdu)) {
+		return -EINVAL;
+	}
+
 	/* PHR (first byte) = length; then MPDU */
 	(void)sl_rail_write_tx_fifo(s_rail_handle, &len, sizeof(len), true);
 	(void)sl_rail_write_tx_fifo(s_rail_handle, data->tx_buffer, len, false);
@@ -1384,7 +1400,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
         .transaction_time = 0 // will be calculated later if DMP is used
     };
 
-	if (tx_mpdu->mhr.fs->fc.ar) {
+	if (tx_mpdu.mhr.fs->fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
 		// time we wait for ACK
 		if(sl_rail_get_symbol_rate(s_rail_handle) > 0) {
@@ -1440,7 +1456,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	/* Block until RAIL events callback sets s_tx_errno and gives tx_wait. */
 	k_sem_take(&data->tx_wait, K_FOREVER);
 
-	if (tx_mpdu->mhr.fs->fc.ar) {
+	if (tx_mpdu.mhr.fs->fc.ar) {
 		k_sem_take(&data->ack_wait, K_FOREVER);
 	}
 	(void)pkt;

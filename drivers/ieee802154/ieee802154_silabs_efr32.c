@@ -141,7 +141,7 @@ static struct ieee802154_mhr enh_ack_mhr;
 static struct ieee802154_header_ie s_csl_header_ie = { 0, };
 static struct ieee802154_header_ie s_link_metrics_header_ie = { 0, };
 static uint16_t s_ack_ie_short_addr;
-static uint8_t s_ack_ie_ext_addr[IEEE802154_MAX_ADDR_LENGTH];
+static uint8_t s_ack_ie_ext_addr[IEEE802154_EXT_ADDR_LENGTH];
 
 static bool src_match_short_contains(uint16_t short_addr);
 static bool src_match_ext_contains(const uint8_t *addr);
@@ -763,8 +763,7 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
 				s_ack_ie_short_addr == short_addr);
 		} else {
 			set_frame_pending = src_match_ext_contains(src_addr->ext_addr);
-			match = (memcmp(s_ack_ie_ext_addr, src_addr->ext_addr,
-					IEEE802154_MAX_ADDR_LENGTH) == 0);
+			match = (memcmp(s_ack_ie_ext_addr, src_addr->ext_addr, IEEE802154_EXT_ADDR_LENGTH) == 0);
 		}
 		if (!match) {
 			return true; // requested ack IE address does not match
@@ -1655,8 +1654,6 @@ static int silabs_efr32_configure_enh_ack_probing(const struct ieee802154_config
 	if (config->ack_ie.purge_ie) {
 		s_csl_header_ie = (struct ieee802154_header_ie){0};
 		s_link_metrics_header_ie = (struct ieee802154_header_ie){0};
-		s_ack_ie_ext_addr = NULL;
-		s_ack_ie_short_addr = 0;
 		return 0;
 	}
 
@@ -1665,8 +1662,8 @@ static int silabs_efr32_configure_enh_ack_probing(const struct ieee802154_config
 		return -ENOTSUP;
 	}
 
-	sys_put_le16(config->ack_ie.short_addr, s_ack_ie_short_addr);
-	sys_memcpy_swap(s_ack_ie_ext_addr, config->ack_ie.ext_addr, EXTENDED_ADDRESS_SIZE);
+	s_ack_ie_short_addr = sys_get_le16((uint8_t *)&config->ack_ie.short_addr);
+	sys_memcpy_swap(s_ack_ie_ext_addr, config->ack_ie.ext_addr, IEEE802154_EXT_ADDR_LENGTH);
 
 	uint8_t element_id = ieee802154_header_ie_get_element_id(config->ack_ie.header_ie);
 	if (element_id != IEEE802154_HEADER_IE_ELEMENT_ID_CSL_IE &&
@@ -1675,9 +1672,9 @@ static int silabs_efr32_configure_enh_ack_probing(const struct ieee802154_config
 	}
 
 	if (element_id == IEEE802154_HEADER_IE_ELEMENT_ID_CSL_IE) {
-		memcpy(&s_csl_header_ie, config->ack_ie.header_ie, config->ack_ie.header_ie.length);
+		memcpy(&s_csl_header_ie, config->ack_ie.header_ie, config->ack_ie.header_ie->length);
 	} else {
-		memcpy(&s_link_metrics_header_ie, config->ack_ie.header_ie, config->ack_ie.header_ie.length);
+		memcpy(&s_link_metrics_header_ie, config->ack_ie.header_ie, config->ack_ie.header_ie->length);
 	}
 
 	return 0;

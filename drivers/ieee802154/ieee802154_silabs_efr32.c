@@ -47,6 +47,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include <zephyr/irq.h>
 
 #include "ieee802154_silabs_efr32.h"
+#include "ieee802154_silabs_packet_utils.h"
 
 #include <em_system.h>
 
@@ -273,6 +274,12 @@ static sl_rail_multi_timer_t s_rail_timer;
 	 // Clean up any ongoing energy scans
 	//  clearAllScans();
  }
+
+void silabs_radio_security_init(void)
+ {
+     // Initialize security material
+     memset(s_sec_keys, 0, sizeof(s_sec_keys));
+ }
  
 
 // Check if a scan is in progress
@@ -300,6 +307,102 @@ bool sli_ot_energy_scan_is_in_progress(void)
     return false;
 }
 */
+
+static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_data *data,
+						   uint8_t len,
+						   struct ieee802154_mhr *mhr)
+{
+	uint8_t *tx_psdu = data->tx_buffer + 1;
+	const uint8_t *key = NULL;
+	uint8_t key_id = data->current_key_id;
+	int key_slot = 1;
+
+	if (len < IEEE802154_FCF_SEQ_LENGTH) {
+		return;
+	}
+	if (!mhr->fs->fc.security_enabled) {
+		return;
+	}
+	if (mhr->fs->fc.frame_type == IEEE802154_FRAME_TYPE_ACK) {
+		bool ack_key_matched = false;
+
+		if (mhr->aux_sec != NULL &&
+		    mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
+			uint8_t frame_key_id = mhr->aux_sec->kif.mode_1.key_index;
+
+			if (frame_key_id != 0U) {
+				if (frame_key_id == data->key_id_prev) {
+					key_slot = 0;
+					key_id = data->key_id_prev;
+					ack_key_matched = true;
+				} else if (frame_key_id == data->current_key_id) {
+					key_slot = 1;
+					key_id = data->current_key_id;
+					ack_key_matched = true;
+				} else if (frame_key_id == data->key_id_next) {
+					key_slot = 2;
+					key_id = data->key_id_next;
+					ack_key_matched = true;
+				}
+			}
+		}
+		if (!ack_key_matched) {
+			LOG_WRN("ACK key_id missing or no matching key");
+			return;
+		}
+		key = s_sec_keys[key_slot].key_value;
+		if (key == NULL) {
+			LOG_WRN("ACK key slot has no key");
+			return;
+		}
+	} else {
+		if (s_sec_keys[key_slot].key_value != NULL) {
+			key = s_sec_keys[key_slot].key_value;
+		}
+		if (key == NULL) {
+			key = s_sec_keys[1].key_value;
+			key_id = data->current_key_id;
+			if (key == NULL) {
+				for (int i = 0; i < SILABS_SEC_KEY_SLOTS; i++) {
+					if (s_sec_keys[i].key_value != NULL) {
+						key = s_sec_keys[i].key_value;
+						key_id = (i == 0) ? data->key_id_prev :
+							 (i == 1) ? data->current_key_id : data->key_id_next;
+						break;
+					}
+				}
+			}
+		}
+	}
+	if (key == NULL) {
+		LOG_WRN("TX security enabled but no key configured");
+		return;
+	}
+	{
+		uint8_t *aux = (uint8_t *)mhr->aux_sec;
+		uint32_t fc = data->frame_counter;
+		uint8_t header_length = get_mhr_length(mhr);
+		uint8_t security_level = mhr->aux_sec->control.security_level;
+		uint8_t nonce[SILABS_CCM_NONCE_SIZE];
+
+		aux[1] = (uint8_t)(fc);
+		aux[2] = (uint8_t)(fc >> 8);
+		aux[3] = (uint8_t)(fc >> 16);
+		aux[4] = (uint8_t)(fc >> 24);
+		data->frame_counter++;
+
+		if (key_id != 0U &&
+		    mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
+			mhr->aux_sec->kif.mode_1.key_index = key_id;
+		}
+
+		silabs_generate_nonce(data->ext_addr, fc, security_level, nonce);
+		if (!silabs_tx_ccm(tx_psdu, len, header_length,
+				   security_level, key, nonce)) {
+			LOG_ERR("TX security (AES-CCM) failed");
+		}
+	}
+}
 
 /*************************************************************************************************************************/
 /// Radio State Machine
@@ -1256,7 +1359,7 @@ static int silabs_efr32_rail_init(void)
 		LOG_ERR("sl_rail_ieee802154_enable_data_frame_pending failed: %d", (int)status);
 		return -EIO;
 	}
-	// TODO: sl_ot_radio_security_init()
+	silabs_radio_security_init();
 #endif // (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
 
 	// Enable RAIL multi-timer
@@ -1491,20 +1594,20 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 
 	// TODO update frame IE
 
-	// TODO sli_ot_radio_security_process_transmit
-
 	silabs_radio_state_set_tx_data_ongoing(true);
 
 	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
 
 	uint8_t len = (uint8_t)frag->len + 2U; // Add CRC byte length (2 bytes)
-	if (frag->len > IEEE802154_MTU) {
+	if (len > IEEE802154_MAX_PHY_PACKET_SIZE) {
 		return -EMSGSIZE;
 	}
+
 	memcpy(&data->tx_buffer, frag->data, len);
 	load_mhr(data->tx_buffer, &tx_mhr);
 
-	/* PHR (first byte) = length; then MPDU */
+	sli_ot_radio_security_process_transmit(data, len,  &tx_mhr);
+
 	(void)sl_rail_write_tx_fifo(s_rail_handle, &len, sizeof(len), true);
 	(void)sl_rail_write_tx_fifo(s_rail_handle, data->tx_buffer, len, false);
 	k_sem_reset(&data->tx_wait);
@@ -1761,7 +1864,18 @@ static int silabs_efr32_configure(const struct device *dev,
 			return 0;
 		}
 		for (; in->key_value != NULL && sec_key_count < SILABS_SEC_KEY_SLOTS; in++) {
-			memcpy(&s_sec_keys[sec_key_count], in, sizeof(struct ieee802154_key));	
+			memcpy(&s_sec_keys[sec_key_count], in, sizeof(struct ieee802154_key));
+			if (in->key_id != NULL) {
+				uint8_t kid = *in->key_id;
+
+				if (sec_key_count == 0) {
+					data->key_id_prev = kid;
+				} else if (sec_key_count == 1) {
+					data->current_key_id = kid;
+				} else {
+					data->key_id_next = kid;
+				}
+			}
 			sec_key_count++;
 		}
 		return 0;

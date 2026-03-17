@@ -72,8 +72,13 @@ struct silabs_efr32_802154_data {
 	 */
 	 struct k_sem ack_wait;
 
-	/* TX buffer. */
+	/* TX buffer: [PHR][MPDU] for security processing. */
 	uint8_t tx_buffer[IEEE802154_MAX_PHY_PACKET_SIZE];
+
+	/* Key IDs for slots 0=prev, 1=curr, 2=next (set from IEEE802154_CONFIG_MAC_KEYS). */
+	uint8_t key_id_prev;
+	uint8_t current_key_id;
+	uint8_t key_id_next;
 
 	/* TX result, updated in radio transmit callbacks. */
 	uint8_t tx_result;

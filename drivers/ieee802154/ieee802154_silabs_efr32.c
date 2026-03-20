@@ -656,7 +656,7 @@ static bool src_match_ext_contains(const uint8_t *addr)
 
 
 /*************************************************************************************************************************/
-/// Radio Event Processsing
+/// Packet Processing
 
 static uint8_t read_initial_packet_data(sl_rail_rx_packet_info_t *packet_info,
 	uint8_t                   expected_data_bytes_max,
@@ -699,6 +699,25 @@ static uint8_t read_initial_packet_data(sl_rail_rx_packet_info_t *packet_info,
 	load_mhr(buffer, &rx_mhr);
 	// Put it back to packetBytes.
 	return (uint8_t)adjusted_packet_info.packet_bytes;
+}
+
+static inline uint16_t get_csl_phase(uint32_t rx_timestamp, uint16_t rx_packet_bytes, uint16_t rx_frame_length)
+{
+	uint32_t shr_done_time = rx_timestamp - (rx_packet_bytes * OT_RADIO_SYMBOL_TIME * 2)
+	// PHR of this packet
+	+ (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
+	// Received frame's expected time in the PHR
+	+ (rx_frame_length * OT_RADIO_SYMBOL_TIME * 2)
+	// rxToTx turnaround time
+	+ s_rail_ieee802154_config.timings.rx_to_tx
+	// PHR time of the ACK
+	+ (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
+	// SHR time of the ACK
+	+ (SHR_SIZE * OT_RADIO_SYMBOL_TIME * 2);
+
+	uint32_t csl_period_us = silabs_efr32_data.csl_period * OT_US_PER_TEN_SYMBOLS;
+	uint32_t diff = ((silabs_efr32_data.csl_sample_time % csl_period_us) - (shr_done_time % csl_period_us) + csl_period_us) % csl_period_us;
+	return (uint16_t)(diff / OT_US_PER_TEN_SYMBOLS);
 }
 
 static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack,
@@ -794,28 +813,8 @@ void handle_data_request_command(void)
 }
 
 #if (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
-
 //------------------------------------------------------------------------------
 // Radio implementation: Enhanced ACKs, CSL
-
-static inline uint16_t get_csl_phase(uint32_t rx_timestamp, uint16_t rx_packet_bytes, uint16_t rx_frame_length)
-{
-	uint32_t shr_done_time = rx_timestamp - (rx_packet_bytes * OT_RADIO_SYMBOL_TIME * 2)
-	// PHR of this packet
-	+ (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
-	// Received frame's expected time in the PHR
-	+ (rx_frame_length * OT_RADIO_SYMBOL_TIME * 2)
-	// rxToTx turnaround time
-	+ s_rail_ieee802154_config.timings.rx_to_tx
-	// PHR time of the ACK
-	+ (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
-	// SHR time of the ACK
-	+ (SHR_SIZE * OT_RADIO_SYMBOL_TIME * 2);
-
-	uint32_t csl_period_us = silabs_efr32_data.csl_period * OT_US_PER_TEN_SYMBOLS;
-	uint32_t diff = ((silabs_efr32_data.csl_sample_time % csl_period_us) - (shr_done_time % csl_period_us) + csl_period_us) % csl_period_us;
-	return (uint16_t)(diff / OT_US_PER_TEN_SYMBOLS);
-}
 
 // Return false if we should generate an immediate ACK
 // Return true otherwise
@@ -947,6 +946,10 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
 	return true;
 }
 #endif // (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
+
+
+/*************************************************************************************************************************/
+/// Radio Event Processing
 
 static inline void handle_tx_failed(void)
 {

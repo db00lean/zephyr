@@ -266,21 +266,20 @@ static sl_rail_multi_timer_t s_rail_timer;
  * Initialize energy scan module.
  * No initialization needed for per-scan objects.
  */
- void sli_ot_energy_scan_init(void)
- {
+void sli_ot_energy_scan_init(void)
+{
 	 // Initialize the timer to zero
 	 memset(&s_rail_timer, 0, sizeof(s_rail_timer));
  
 	 // Clean up any ongoing energy scans
 	//  clearAllScans();
- }
+} 
 
 void silabs_radio_security_init(void)
- {
-     // Initialize security material
-     memset(s_sec_keys, 0, sizeof(s_sec_keys));
- }
- 
+{
+	// Initialize security material
+	memset(s_sec_keys, 0, sizeof(s_sec_keys));
+}
 
 // Check if a scan is in progress
 /*
@@ -309,8 +308,8 @@ bool sli_ot_energy_scan_is_in_progress(void)
 */
 
 static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_data *data,
-						   uint8_t len,
-						   struct ieee802154_mhr *mhr)
+							uint8_t len,
+							struct ieee802154_mhr *mhr)
 {
 	uint8_t *tx_psdu = data->tx_buffer + 1;
 	const uint8_t *key = NULL;
@@ -326,8 +325,7 @@ static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_da
 	if (mhr->fs->fc.frame_type == IEEE802154_FRAME_TYPE_ACK) {
 		bool ack_key_matched = false;
 
-		if (mhr->aux_sec != NULL &&
-		    mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
+		if (mhr->aux_sec != NULL && mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
 			uint8_t frame_key_id = mhr->aux_sec->kif.mode_1.key_index;
 
 			if (frame_key_id != 0U) {
@@ -366,8 +364,7 @@ static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_da
 				for (int i = 0; i < SILABS_SEC_KEY_SLOTS; i++) {
 					if (s_sec_keys[i].key_value != NULL) {
 						key = s_sec_keys[i].key_value;
-						key_id = (i == 0) ? data->key_id_prev :
-							 (i == 1) ? data->current_key_id : data->key_id_next;
+						key_id = (i == 0) ? data->key_id_prev : (i == 1) ? data->current_key_id : data->key_id_next;
 						break;
 					}
 				}
@@ -391,14 +388,12 @@ static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_da
 		aux[4] = (uint8_t)(fc >> 24);
 		data->frame_counter++;
 
-		if (key_id != 0U &&
-		    mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
+		if (key_id != 0U && mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
 			mhr->aux_sec->kif.mode_1.key_index = key_id;
 		}
 
 		silabs_generate_nonce(data->ext_addr, fc, security_level, nonce);
-		if (!silabs_tx_ccm(tx_psdu, len, header_length,
-				   security_level, key, nonce)) {
+		if (!silabs_tx_ccm(tx_psdu, len, header_length, security_level, key, nonce)) {
 			LOG_ERR("TX security (AES-CCM) failed");
 		}
 	}
@@ -963,6 +958,7 @@ static inline void handle_ack_timeout(void)
 	__ASSERT_NO_MSG(silabs_radio_state_is_waiting_for_ack());
 	silabs_radio_state_set_tx_data_ongoing(false);
 	silabs_radio_state_set_waiting_for_ack(false);
+	k_sem_give(&silabs_efr32_data.ack_wait);
 	s_tx_errno = -ENOMSG;
 	yield_radio();
 	s_em_pending_data = false;
@@ -1088,6 +1084,7 @@ static void handle_rx_pkt(void)
 		    tx_mhr.fs->fc.ar &&
 		    rx_mhr.fs->sequence == tx_mhr.fs->sequence) {
 			handle_rx_ack(packet_length, &packet_details);
+			k_sem_give(&silabs_efr32_data.ack_wait);
 			s_tx_errno = 0;
 			silabs_radio_state_clear_tx_data_and_wait_for_ack();
 			if (tx_is_data_request && rx_mhr.fs->fc.frame_pending) {
@@ -1602,7 +1599,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
 
 	uint8_t len = (uint8_t)frag->len + 2U; // Add CRC byte length (2 bytes)
-	if (len > IEEE802154_MAX_PHY_PACKET_SIZE) {
+	if (frag->len > IEEE802154_MAX_PHY_PACKET_SIZE) {
 		return -EMSGSIZE;
 	}
 
@@ -1611,6 +1608,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 
 	sli_ot_radio_security_process_transmit(data, len,  &tx_mhr);
 
+	/* PHR (first byte) = length; then MPDU */
 	(void)sl_rail_write_tx_fifo(s_rail_handle, &len, sizeof(len), true);
 	(void)sl_rail_write_tx_fifo(s_rail_handle, data->tx_buffer, len, false);
 	k_sem_reset(&data->tx_wait);

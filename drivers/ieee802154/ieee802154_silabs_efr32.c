@@ -1561,6 +1561,11 @@ static int silabs_efr32_start(const struct device *dev)
 static int silabs_efr32_stop(const struct device *dev)
 {
 	ARG_UNUSED(dev);
+
+	if (silabs_radio_state_is_tx_data_ongoing()) {
+		return 0;
+	}
+
 	if (s_rail_initialized) {
 		set_radio_to_idle();
 	}
@@ -1624,20 +1629,24 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	if (tx_mhr.fs->fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
 		// time we wait for ACK
+#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
 		if(sl_rail_get_symbol_rate(s_rail_handle) > 0) {
 			tx_scheduler_info.transaction_time +=
                 (sl_rail_time_t)(12 * 1e6 / sl_rail_get_symbol_rate(s_rail_handle));
 		} else {
 			tx_scheduler_info.transaction_time += 12 * RADIO_TIMING_DEFAULT_SYMBOLTIME_US;
 		}
+#endif
 	}
 
+#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
 	if (sl_rail_get_bit_rate(s_rail_handle) > 0) {
         tx_scheduler_info.transaction_time +=
             (sl_rail_time_t)((len + 4 + 1 + 1) * 8 * 1e6 / sl_rail_get_bit_rate(s_rail_handle));
 	} else { // assume 250kbps
         tx_scheduler_info.transaction_time += (len + 4 + 1 + 1) * RADIO_TIMING_DEFAULT_BYTETIME_US;
 	}
+#endif
 
 	// Prioritize the Tx over schedule Rx to avoid missing data check-ins such as data polls.
     idle_radio();
@@ -1647,8 +1656,11 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	switch (mode) {
 		case IEEE802154_TX_MODE_CSMA_CA:
 			// time needed for CSMA/CA
+#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
 			tx_scheduler_info.transaction_time += RADIO_TIMING_CSMA_OVERHEAD_US;
+#endif
 			sl_rail_csma_config_t csma = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA;
+			// TODO set csma.csma_tries
 			csma.cca_threshold_dbm = CCA_THRESHOLD_DEFAULT;
 			start_st = sl_rail_start_cca_csma_tx(s_rail_handle,
 				(uint8_t)data->current_channel,
@@ -2015,8 +2027,10 @@ static int silabs_efr32_init(const struct device *dev)
 #endif
 				| SL_RAIL_EVENTS_TXACK_COMPLETION | SL_RAIL_EVENTS_TX_COMPLETION
 				| SL_RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND
+#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
 				| SL_RAIL_EVENT_CONFIG_SCHEDULED | SL_RAIL_EVENT_CONFIG_UNSCHEDULED
 				| SL_RAIL_EVENT_SCHEDULER_STATUS
+#endif
 				| SL_RAIL_EVENT_CAL_NEEDED));
 		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
 

@@ -954,8 +954,10 @@ static inline void handle_tx_failed(void)
 
 static inline void handle_ack_timeout(void)
 {
-	__ASSERT_NO_MSG(silabs_radio_state_is_tx_data_ongoing());
-	__ASSERT_NO_MSG(silabs_radio_state_is_waiting_for_ack());
+	bool r = silabs_radio_state_is_tx_data_ongoing();
+	__ASSERT_NO_MSG(r);
+	r = silabs_radio_state_is_waiting_for_ack();
+	__ASSERT_NO_MSG(r);
 	silabs_radio_state_set_tx_data_ongoing(false);
 	silabs_radio_state_set_waiting_for_ack(false);
 	k_sem_give(&silabs_efr32_data.ack_wait);
@@ -1583,7 +1585,8 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 
 	idle_radio();
 
-	__ASSERT_NO_MSG(!silabs_radio_state_is_tx_data_ongoing());
+	bool r = silabs_radio_state_is_tx_data_ongoing();
+	__ASSERT_NO_MSG(!r);
 
 #if defined(CONFIG_OPENTHREAD_PLATFORM_PKT_TXTIME)
 
@@ -2050,9 +2053,11 @@ static int silabs_efr32_init(const struct device *dev)
 											(SL_RAIL_IEEE802154_E_OPTION_GB868 | SL_RAIL_IEEE802154_E_OPTION_ENH_ACK));
 #endif // (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
 
-		__ASSERT_NO_MSG(sl_rail_util_pa_post_init(s_rail_handle, SL_RAIL_TX_PA_MODE_2P4_GHZ) == SL_RAIL_STATUS_NO_ERROR);
+		status = sl_rail_util_pa_post_init(s_rail_handle, SL_RAIL_TX_PA_MODE_2P4_GHZ);
+		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
 
-		__ASSERT_NO_MSG(silabs_efr32_set_txpower(dev, (sl_rail_tx_power_t)OPENTHREAD_CONFIG_DEFAULT_TRANSMIT_POWER) == 0);
+		r = silabs_efr32_set_txpower(dev, (sl_rail_tx_power_t)OPENTHREAD_CONFIG_DEFAULT_TRANSMIT_POWER);
+		__ASSERT_NO_MSG(r == 0);
 
 		s_rail_initialized = true;
 

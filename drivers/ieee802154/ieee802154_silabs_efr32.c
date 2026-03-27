@@ -691,7 +691,7 @@ static uint8_t read_initial_packet_data(sl_rail_rx_packet_info_t *packet_info,
 
 	// Copy number of bytes as indicated in `packet_info->first_portion_bytes` into the buffer.
 	(void)sl_rail_copy_rx_packet(s_rail_handle, buffer, &adjusted_packet_info);
-	load_mhr(buffer, &rx_mhr);
+	load_mhr(&buffer[1], &rx_mhr);
 	// Put it back to packetBytes.
 	return (uint8_t)adjusted_packet_info.packet_bytes;
 }
@@ -1513,7 +1513,8 @@ static int silabs_efr32_filter(const struct device *dev, bool set,
 		break;
 	case IEEE802154_FILTER_TYPE_IEEE_ADDR:
 		if (s_rail_initialized) {
-			memcpy(data->ext_addr, filter->ieee_addr, sizeof(data->ext_addr));
+			sys_memcpy_swap(data->ext_addr, filter->ieee_addr,
+					IEEE802154_EXT_ADDR_LENGTH);
 			sl_rail_ieee802154_set_long_address(s_rail_handle, filter->ieee_addr, 0);
 		}
 		break;

@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "zephyr/net/ieee802154_mac.h"
+#include <stdint.h>
 #define DT_DRV_COMPAT silabs_efr32_ieee802154
 
 #define LOG_MODULE_NAME ieee802154_silabs_efr32
@@ -129,7 +131,14 @@ static uint8_t  s_src_match_ext[SILABS_SRC_MATCH_EXT_MAX][8];
 static uint8_t  s_src_match_short_count;
 static uint8_t  s_src_match_ext_count;
 
+/** One heap block per MAC key slot: key bytes + key index (see @ref silabs_radio_security_init). */
+struct silabs_sec_key_buf {
+	uint8_t key_value[IEEE802154_KEY_MAX_LEN];
+	uint8_t key_id;
+};
+
 static struct ieee802154_key s_sec_keys[SILABS_SEC_KEY_SLOTS];
+static void *s_sec_key_allocs[SILABS_SEC_KEY_SLOTS];
 
 /* Driver data; defined here so the events callback can reference it. */
 static struct silabs_efr32_802154_data silabs_efr32_data;
@@ -214,6 +223,30 @@ static inline void load_addr(uint8_t *buffer, uint8_t *length,
 	*addr = (struct ieee802154_address_field *)buffer;
 }
 
+/* ASH key id field length depends on key_id_mode; sizeof(aux_security_hdr) is wrong. */
+static inline uint8_t silabs_aux_security_hdr_length(const struct ieee802154_aux_security_hdr *ash)
+{
+	uint8_t len = IEEE802154_SECURITY_CF_LENGTH + IEEE802154_SECURITY_FRAME_COUNTER_LENGTH;
+
+	switch (ash->control.key_id_mode) {
+	case IEEE802154_KEY_ID_MODE_IMPLICIT:
+		break;
+	case IEEE802154_KEY_ID_MODE_INDEX:
+		len += IEEE802154_KEY_ID_FIELD_INDEX_LENGTH;
+		break;
+	case IEEE802154_KEY_ID_MODE_SRC_4_INDEX:
+		len += IEEE802154_KEY_ID_FIELD_SRC_4_INDEX_LENGTH;
+		break;
+	case IEEE802154_KEY_ID_MODE_SRC_8_INDEX:
+		len += IEEE802154_KEY_ID_FIELD_SRC_8_INDEX_LENGTH;
+		break;
+	default:
+		break;
+	}
+
+	return len;
+}
+
 static inline void load_mhr(uint8_t *buffer, struct ieee802154_mhr *mhr)
 {
 	mhr->fs = (struct ieee802154_fcf_seq *)buffer;
@@ -224,7 +257,7 @@ static inline void load_mhr(uint8_t *buffer, struct ieee802154_mhr *mhr)
 
 	if (mhr->fs->fc.security_enabled) {
 		mhr->aux_sec = (struct ieee802154_aux_security_hdr *)(buffer + length);
-		length += sizeof(struct ieee802154_aux_security_hdr);
+		length += silabs_aux_security_hdr_length(mhr->aux_sec);
 	} else {
 		mhr->aux_sec = NULL;
 	}
@@ -250,8 +283,8 @@ static inline uint8_t get_mhr_length(struct ieee802154_mhr *mhr)
 		length += IEEE802154_EXT_ADDR_LENGTH;
 	}
 
-	if (mhr->fs->fc.security_enabled) {
-		length += sizeof(struct ieee802154_aux_security_hdr);
+	if (mhr->fs->fc.security_enabled && mhr->aux_sec != NULL) {
+		length += silabs_aux_security_hdr_length(mhr->aux_sec);
 	}
 
 	return length;
@@ -277,8 +310,29 @@ void sli_ot_energy_scan_init(void)
 
 void silabs_radio_security_init(void)
 {
-	// Initialize security material
+	if (s_sec_key_allocs[0] != NULL) {
+		return;
+	}
+
 	memset(s_sec_keys, 0, sizeof(s_sec_keys));
+
+	for (int k = 0; k < SILABS_SEC_KEY_SLOTS; k++) {
+		struct silabs_sec_key_buf *buf = k_malloc(sizeof(*buf));
+
+		if (buf == NULL) {
+			for (int j = 0; j < k; j++) {
+				k_free(s_sec_key_allocs[j]);
+				s_sec_key_allocs[j] = NULL;
+			}
+			LOG_ERR("MAC key slot %d: k_malloc failed", k);
+			return;
+		}
+
+		memset(buf, 0, sizeof(*buf));
+		s_sec_key_allocs[k] = buf;
+		s_sec_keys[k].key_value = buf->key_value;
+		s_sec_keys[k].key_id = &buf->key_id;
+	}
 }
 
 // Check if a scan is in progress
@@ -308,10 +362,10 @@ bool sli_ot_energy_scan_is_in_progress(void)
 */
 
 static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_data *data,
+							uint8_t *buffer,
 							uint8_t len,
 							struct ieee802154_mhr *mhr)
 {
-	uint8_t *tx_psdu = data->tx_buffer + 1;
 	const uint8_t *key = NULL;
 	uint8_t key_id = data->current_key_id;
 	int key_slot = 1;
@@ -320,6 +374,9 @@ static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_da
 		return;
 	}
 	if (!mhr->fs->fc.security_enabled) {
+		return;
+	}
+	if (key_id != 1) {
 		return;
 	}
 	if (mhr->fs->fc.frame_type == IEEE802154_FRAME_TYPE_ACK) {
@@ -376,24 +433,20 @@ static void sli_ot_radio_security_process_transmit(struct silabs_efr32_802154_da
 		return;
 	}
 	{
-		uint8_t *aux = (uint8_t *)mhr->aux_sec;
-		uint32_t fc = data->frame_counter;
+		struct ieee802154_aux_security_hdr *aux = mhr->aux_sec;
 		uint8_t header_length = get_mhr_length(mhr);
 		uint8_t security_level = mhr->aux_sec->control.security_level;
 		uint8_t nonce[SILABS_CCM_NONCE_SIZE];
 
-		aux[1] = (uint8_t)(fc);
-		aux[2] = (uint8_t)(fc >> 8);
-		aux[3] = (uint8_t)(fc >> 16);
-		aux[4] = (uint8_t)(fc >> 24);
+		sys_memcpy_swap(&aux->frame_counter, &data->frame_counter, sizeof(uint32_t));
 		data->frame_counter++;
 
 		if (key_id != 0U && mhr->aux_sec->control.key_id_mode == IEEE802154_KEY_ID_MODE_INDEX) {
 			mhr->aux_sec->kif.mode_1.key_index = key_id;
 		}
 
-		silabs_generate_nonce(data->ext_addr, fc, security_level, nonce);
-		if (!silabs_tx_ccm(tx_psdu, len, header_length, security_level, key, nonce)) {
+		silabs_generate_nonce(data->ext_addr, aux->frame_counter, security_level, nonce);
+		if (!silabs_tx_ccm(buffer, len, header_length, security_level, key, nonce)) {
 			LOG_ERR("TX security (AES-CCM) failed");
 		}
 	}
@@ -925,7 +978,7 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
 	}
 
 	if (rx_mhr.fs->fc.security_enabled) {
-		// TODO sli_ot_radio_security_process_transmit
+		sli_ot_radio_security_process_transmit(&silabs_efr32_data, silabs_efr32_data.enh_ack_buffer, enh_ack_len,  &enh_ack_mhr);
 	}
 
 	// TODO ask why we do this????
@@ -1615,8 +1668,9 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	memcpy(&data->tx_buffer, frag->data, len);
 	load_mhr(data->tx_buffer, &tx_mhr);
 
-	sli_ot_radio_security_process_transmit(data, len,  &tx_mhr);
-
+	if (!net_pkt_ieee802154_frame_secured(pkt)) {
+		sli_ot_radio_security_process_transmit(data, data->tx_buffer, len, &tx_mhr);
+	}
 	/* PHR (first byte) = length; then MPDU */
 	(void)sl_rail_write_tx_fifo(s_rail_handle, &len, sizeof(len), true);
 	(void)sl_rail_write_tx_fifo(s_rail_handle, data->tx_buffer, len, false);
@@ -1881,7 +1935,14 @@ static int silabs_efr32_configure(const struct device *dev,
 			return 0;
 		}
 		for (; in->key_value != NULL && sec_key_count < SILABS_SEC_KEY_SLOTS; in++) {
-			memcpy(&s_sec_keys[sec_key_count], in, sizeof(struct ieee802154_key));
+			s_sec_keys[sec_key_count].key_frame_counter = in->key_frame_counter;
+			s_sec_keys[sec_key_count].frame_counter_per_key = in->frame_counter_per_key;
+			s_sec_keys[sec_key_count].key_id_mode = in->key_id_mode;
+			memcpy(s_sec_keys[sec_key_count].key_id, in->key_id, sizeof(uint8_t));
+			// TODO macro for key size and key id
+			memcpy(s_sec_keys[sec_key_count].key_value, in->key_value,
+			       IEEE802154_KEY_MAX_LEN);
+
 			if (in->key_id != NULL) {
 				uint8_t kid = *in->key_id;
 

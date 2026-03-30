@@ -11,6 +11,8 @@
 #include "em_device.h"
 #include "ieee802154_silabs_packet_utils.h"
 #include "sl_core.h"
+#include "zephyr/net/ieee802154.h"
+#include "zephyr/sys/byteorder.h"
 #if defined(RADIOAES_PRESENT)
 #include "sli_protocol_crypto.h"
 #else
@@ -33,7 +35,7 @@
 #include <openthread/platform/radio.h>
 
 /* AES-CCM constants (IEEE 802.15.4 / Thread) */
-#define AES_CCM_NONCE_SIZE    13
+#define AES_CCM_NONCE_SIZE    IEEE802154_EXT_ADDR_LENGTH + sizeof(uint32_t) + sizeof(uint8_t)
 #define AES_CCM_MIN_TAG_LEN   4
 #define AES_CCM_MAX_TAG_LEN   16
 
@@ -69,12 +71,11 @@ void silabs_generate_nonce(const uint8_t *ext_address,
 			   uint8_t security_level,
 			   uint8_t *nonce)
 {
-	memcpy(nonce, ext_address, 8);
-	nonce[8]  = (uint8_t)(frame_counter >> 24);
-	nonce[9]  = (uint8_t)(frame_counter >> 16);
-	nonce[10] = (uint8_t)(frame_counter >> 8);
-	nonce[11] = (uint8_t)(frame_counter);
-	nonce[12] = security_level;
+	memcpy(nonce, ext_address, IEEE802154_EXT_ADDR_LENGTH);
+	nonce += IEEE802154_EXT_ADDR_LENGTH;
+	sys_memcpy_swap(nonce, &frame_counter, sizeof(uint32_t));
+	nonce += sizeof(uint32_t);
+	nonce[0] = security_level;
 }
 
 #if defined(RADIOAES_PRESENT)

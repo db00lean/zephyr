@@ -131,14 +131,14 @@ static uint8_t  s_src_match_ext[SILABS_SRC_MATCH_EXT_MAX][8];
 static uint8_t  s_src_match_short_count;
 static uint8_t  s_src_match_ext_count;
 
-/** One heap block per MAC key slot: key bytes + key index (see @ref silabs_radio_security_init). */
+/** Static storage per MAC key slot: IEEE 802.15.4 key material + key index byte. */
 struct silabs_sec_key_buf {
 	uint8_t key_value[IEEE802154_KEY_MAX_LEN];
 	uint8_t key_id;
 };
 
+static struct silabs_sec_key_buf s_sec_key_storage[SILABS_SEC_KEY_SLOTS];
 static struct ieee802154_key s_sec_keys[SILABS_SEC_KEY_SLOTS];
-static void *s_sec_key_allocs[SILABS_SEC_KEY_SLOTS];
 
 /* Driver data; defined here so the events callback can reference it. */
 static struct silabs_efr32_802154_data silabs_efr32_data;
@@ -267,8 +267,46 @@ static inline uint8_t get_mhr_length(struct ieee802154_mhr *mhr)
 {
 	uint8_t length = sizeof(struct ieee802154_fcf_seq);
 
-	if (!mhr->fs->fc.pan_id_comp) {
-		length += IEEE802154_PAN_ID_LENGTH;
+	uint8_t da = mhr->fs->fc.dst_addr_mode;
+	uint8_t sa = mhr->fs->fc.src_addr_mode;
+	bool pan_comp = mhr->fs->fc.pan_id_comp;
+	bool dst_none = (da == IEEE802154_ADDR_MODE_NONE);
+	bool src_none = (sa == IEEE802154_ADDR_MODE_NONE);
+
+	if (mhr->fs->fc.frame_version == IEEE802154_VERSION_802154) {
+		/* PAN ID presence: IEEE 802.15.4-2020 Table 7-2 (frame version 0b10). */
+
+		if (dst_none && src_none) {
+			length += pan_comp ? IEEE802154_PAN_ID_LENGTH : 0U;
+		} else if ((!dst_none && src_none) || (dst_none && !src_none)) {
+			length += pan_comp ? 0U : IEEE802154_PAN_ID_LENGTH;
+		} else {
+			bool dst_ext = (da == IEEE802154_ADDR_MODE_EXTENDED);
+			bool src_ext = (sa == IEEE802154_ADDR_MODE_EXTENDED);
+			bool dst_short = (da == IEEE802154_ADDR_MODE_SHORT);
+			bool src_short = (sa == IEEE802154_ADDR_MODE_SHORT);
+
+			if (dst_ext && src_ext) {
+				length += pan_comp ? 0U : IEEE802154_PAN_ID_LENGTH;
+			} else if (dst_short && src_short) {
+				length += pan_comp ? IEEE802154_PAN_ID_LENGTH
+						   : (2U * IEEE802154_PAN_ID_LENGTH);
+			} else if (dst_short || src_short) {
+				length += pan_comp ? IEEE802154_PAN_ID_LENGTH
+						   : (2U * IEEE802154_PAN_ID_LENGTH);
+			} else {
+				// NO-OP: unreachable
+			}
+		}
+	} else {
+		if (pan_comp) {
+			if (!dst_none && !src_none) {
+				length += IEEE802154_PAN_ID_LENGTH;
+			}
+		} else {
+			length += dst_none ? 0U : IEEE802154_PAN_ID_LENGTH;
+			length += src_none ? 0U : IEEE802154_PAN_ID_LENGTH;
+		}
 	}
 
 	if (mhr->fs->fc.src_addr_mode == IEEE802154_ADDR_MODE_SHORT) {
@@ -310,28 +348,12 @@ void sli_ot_energy_scan_init(void)
 
 void silabs_radio_security_init(void)
 {
-	if (s_sec_key_allocs[0] != NULL) {
-		return;
-	}
-
 	memset(s_sec_keys, 0, sizeof(s_sec_keys));
 
 	for (int k = 0; k < SILABS_SEC_KEY_SLOTS; k++) {
-		struct silabs_sec_key_buf *buf = k_malloc(sizeof(*buf));
-
-		if (buf == NULL) {
-			for (int j = 0; j < k; j++) {
-				k_free(s_sec_key_allocs[j]);
-				s_sec_key_allocs[j] = NULL;
-			}
-			LOG_ERR("MAC key slot %d: k_malloc failed", k);
-			return;
-		}
-
-		memset(buf, 0, sizeof(*buf));
-		s_sec_key_allocs[k] = buf;
-		s_sec_keys[k].key_value = buf->key_value;
-		s_sec_keys[k].key_id = &buf->key_id;
+		memset(&s_sec_key_storage[k], 0, sizeof(s_sec_key_storage[k]));
+		s_sec_keys[k].key_value = s_sec_key_storage[k].key_value;
+		s_sec_keys[k].key_id = &s_sec_key_storage[k].key_id;
 	}
 }
 

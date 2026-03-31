@@ -281,21 +281,11 @@ static inline uint8_t get_mhr_length(struct ieee802154_mhr *mhr)
 		} else if ((!dst_none && src_none) || (dst_none && !src_none)) {
 			length += pan_comp ? 0U : IEEE802154_PAN_ID_LENGTH;
 		} else {
-			bool dst_ext = (da == IEEE802154_ADDR_MODE_EXTENDED);
-			bool src_ext = (sa == IEEE802154_ADDR_MODE_EXTENDED);
-			bool dst_short = (da == IEEE802154_ADDR_MODE_SHORT);
-			bool src_short = (sa == IEEE802154_ADDR_MODE_SHORT);
-
-			if (dst_ext && src_ext) {
+			if (da == IEEE802154_ADDR_MODE_EXTENDED && sa == IEEE802154_ADDR_MODE_EXTENDED) {
 				length += pan_comp ? 0U : IEEE802154_PAN_ID_LENGTH;
-			} else if (dst_short && src_short) {
-				length += pan_comp ? IEEE802154_PAN_ID_LENGTH
-						   : (2U * IEEE802154_PAN_ID_LENGTH);
-			} else if (dst_short || src_short) {
-				length += pan_comp ? IEEE802154_PAN_ID_LENGTH
-						   : (2U * IEEE802154_PAN_ID_LENGTH);
 			} else {
-				// NO-OP: unreachable
+				length += pan_comp ? IEEE802154_PAN_ID_LENGTH
+						   : (2U * IEEE802154_PAN_ID_LENGTH);
 			}
 		}
 	} else {

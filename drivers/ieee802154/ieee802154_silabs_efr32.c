@@ -54,6 +54,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include "ieee802154_silabs_packet_utils.h"
 
 #include <em_system.h>
+#include <sl_openthread_pal.h>
 
 /* RAIL handle; init'd once in silabs_efr32_rail_init(). */
 static sl_rail_handle_t s_rail_handle;
@@ -2079,6 +2080,8 @@ static int silabs_efr32_init(const struct device *dev)
 	}
 
 	{
+		sl_openthread_init();
+		
 		sl_rail_status_t status;
 
 		int r = silabs_efr32_rail_init();

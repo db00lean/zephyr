@@ -1012,6 +1012,7 @@ static bool write_enhanced_ack(sl_rail_rx_packet_info_t *packet_info_for_enh_ack
 static inline void handle_tx_failed(void)
 {
 	silabs_radio_state_clear_tx_data_and_wait_for_ack();
+	k_sem_give(&silabs_efr32_data.tx_wait);
 	yield_radio();
 }
 
@@ -1697,7 +1698,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	if (tx_mhr.fs->fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
 		// time we wait for ACK
-#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
+#ifdef CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL
 		if(sl_rail_get_symbol_rate(s_rail_handle) > 0) {
 			tx_scheduler_info.transaction_time +=
                 (sl_rail_time_t)(12 * 1e6 / sl_rail_get_symbol_rate(s_rail_handle));
@@ -1707,7 +1708,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 #endif
 	}
 
-#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
+#ifdef CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL
 	if (sl_rail_get_bit_rate(s_rail_handle) > 0) {
         tx_scheduler_info.transaction_time +=
             (sl_rail_time_t)((len + 4 + 1 + 1) * 8 * 1e6 / sl_rail_get_bit_rate(s_rail_handle));
@@ -1724,7 +1725,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	switch (mode) {
 		case IEEE802154_TX_MODE_CSMA_CA:
 			// time needed for CSMA/CA
-#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
+#ifdef CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL
 			tx_scheduler_info.transaction_time += RADIO_TIMING_CSMA_OVERHEAD_US;
 #endif
 			sl_rail_csma_config_t csma = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA;
@@ -2102,7 +2103,7 @@ static int silabs_efr32_init(const struct device *dev)
 #endif
 				| SL_RAIL_EVENTS_TXACK_COMPLETION | SL_RAIL_EVENTS_TX_COMPLETION
 				| SL_RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND
-#ifdef CONFIG_SILABS_GECKO_RAIL_MULTIPROTOCOL
+#ifdef CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL
 				| SL_RAIL_EVENT_CONFIG_SCHEDULED | SL_RAIL_EVENT_CONFIG_UNSCHEDULED
 				| SL_RAIL_EVENT_SCHEDULER_STATUS
 #endif

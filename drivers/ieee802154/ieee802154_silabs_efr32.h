@@ -94,6 +94,8 @@ struct sl_802154_ack_ie_data {
 	 * for the enclosing struct ends up after this field, not before.
 	 */
 	struct ieee802154_header_ie link_metrics_header_ie;
+
+	struct ieee802154_header_ie csl_header_ie;
 };
 
 /* RAIL buffers: use SDK builtin for RX; provide our own TX FIFO (no builtin).
@@ -199,6 +201,10 @@ struct sl_802154_data {
 	 * Set in events callback.
 	 */
 	int tx_errno;
+
+	/* CSL sample time and period. */
+	uint32_t csl_sample_time;
+	uint32_t csl_period_us;
 
 	/* Current channel (11-26 for 2.4 GHz O-QPSK). Set by set_channel(). */
 	uint16_t current_channel;

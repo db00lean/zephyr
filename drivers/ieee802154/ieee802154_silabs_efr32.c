@@ -752,6 +752,31 @@ static bool sl_802154_src_match_contains(struct sl_802154_data *data)
 /*************************************************************************************************/
 /* Packet Processing */
 
+#if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
+static inline uint16_t sl_802154_get_csl_phase(struct sl_802154_data *data, uint32_t rx_timestamp, uint16_t rx_packet_bytes,
+				     uint16_t rx_frame_length)
+{
+	uint32_t shr_done_time = rx_timestamp -
+				 (rx_packet_bytes * OT_RADIO_SYMBOL_TIME * 2)
+				 /* PHR of this packet */
+				 + (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
+				 /* Received frame's expected time in the PHR */
+				 + (rx_frame_length * OT_RADIO_SYMBOL_TIME * 2)
+				 /* rxToTx turnaround time */
+				 + s_rail_ieee802154_config.timings.rx_to_tx
+				 /* PHR time of the ACK */
+				 + (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
+				 /* SHR time of the ACK */
+				 + (SHR_SIZE * OT_RADIO_SYMBOL_TIME * 2);
+
+	uint32_t csl_period_us = data->csl_period_us * OT_US_PER_TEN_SYMBOLS;
+	uint32_t diff = ((data->csl_sample_time % csl_period_us) -
+			 (shr_done_time % csl_period_us) + csl_period_us) %
+			csl_period_us;
+	return (uint16_t)(diff / OT_US_PER_TEN_SYMBOLS);
+}
+#endif
+
 /* Peek the in-progress RX frame into data->rx_buffer and parse MHR.
  *
  * @return Positive: total packet bytes captured for peek (includes PHR).
@@ -823,7 +848,7 @@ static int sl_802154_read_initial_pkt_data(struct sl_802154_data *data,
 }
 
 /* ------------------------------------------------------------------------------
- * Radio implementation: Enhanced ACKs
+ * Radio implementation: Enhanced ACKs, CSL
  */
 
 /* Peek through SecHdr after DATA_REQUEST (worst-case extended src/dst + key id mode 2). */
@@ -1073,6 +1098,10 @@ static int sl_802154_write_enhanced_ack(struct sl_802154_data *data,
 		ie_present = match && (data->ack_ie.link_metrics_header_ie.length > 0);
 	}
 
+	if (IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT)) {
+		ie_present = match && (data->ack_ie.csl_header_ie.length > 0);
+	}
+
 	enh_ack_mhr_length = sl_802154_construct_enh_ack_mhr(data, ie_present);
 	enh_ack_len = SL_802154_PHR_BYTES + enh_ack_mhr_length;
 
@@ -1083,6 +1112,25 @@ static int sl_802154_write_enhanced_ack(struct sl_802154_data *data,
 
 		memcpy(data->enh_ack_buffer + enh_ack_len,
 		       &data->ack_ie.link_metrics_header_ie, ie_total);
+		enh_ack_len += (uint8_t)ie_total;
+	}
+
+	if (IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT) && ie_present) {
+		/* This should be set to the expected length of the packet is being received.
+		* We consider this while calculating the phase value below.
+		*/
+		uint16_t recv_len = pkt_info_for_enh_ack->p_first_portion_data[0];
+		data->ack_ie.csl_header_ie.content.csl.reduced.csl_phase = sl_802154_get_csl_phase(
+			data, rx_timestamp, pkt_info_for_enh_ack->packet_bytes, recv_len);
+		data->ack_ie.csl_header_ie.content.csl.reduced.csl_period =
+			(uint16_t)data->csl_period_us;
+
+		/* append CSL IE header to payload */
+		size_t ie_total = IEEE802154_HEADER_IE_HEADER_LENGTH +
+		data->ack_ie.csl_header_ie.length;
+
+		memcpy(data->enh_ack_buffer + enh_ack_len,
+		       &data->ack_ie.csl_header_ie, ie_total);
 		enh_ack_len += (uint8_t)ie_total;
 	}
 
@@ -2096,6 +2144,21 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	}
 	len = (uint8_t)(frag->len + IEEE802154_FCS_LENGTH); /* PSDU = MPDU + FCS */
 
+#if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
+	struct net_ptp_time *tx_time = net_pkt_timestamp(pkt);
+
+	if (data->csl_period_us > 0 && (tx_time->second == 0 && tx_time->nanosecond == 0)) {
+		/* Only called for CSL children (CSL period > 0)
+		 * Note: Our SSEDs "schedule" transmissions to their parent in order to know
+		 * exactly when in the future the data packets go out so they can calculate
+		 * the accurate CSL phase to send to their parent.
+		 */
+		net_pkt_set_timestamp_ns(pkt, silabs_efr32_get_time(dev) +
+						      (SL_802154_SCHEDULE_TX_DELAY_US + SL_802154_SHR_DURATION_US) *
+							      NSEC_PER_USEC);
+	}
+#endif
+
 	sl_802154_state_set_tx_data_ongoing(&data->radio_data.state, true);
 
 	memcpy(data->tx_buffer, frag->data, frag->len); /* RAIL appends FCS. */
@@ -2390,6 +2453,10 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 			memset(&data->ack_ie.link_metrics_header_ie, 0,
 			       sizeof(data->ack_ie.link_metrics_header_ie));
 		}
+		if (IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT)) {
+			memset(&data->ack_ie.csl_header_ie, 0,
+			       sizeof(data->ack_ie.csl_header_ie));
+		}
 		return 0;
 	}
 
@@ -2410,9 +2477,6 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 	}
 
 	element_id = ieee802154_header_ie_get_element_id(config->ack_ie.header_ie);
-	if (element_id != IEEE802154_HEADER_IE_ELEMENT_ID_VENDOR_SPECIFIC_IE) {
-		return -ENOTSUP;
-	}
 
 	if (element_id == IEEE802154_HEADER_IE_ELEMENT_ID_VENDOR_SPECIFIC_IE &&
 	    IS_ENABLED(CONFIG_OPENTHREAD_LINK_METRICS_SUBJECT)) {
@@ -2421,8 +2485,16 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 			return -EMSGSIZE;
 		}
 		memcpy(&data->ack_ie.link_metrics_header_ie, config->ack_ie.header_ie, ie_total);
+	} else if (element_id == IEEE802154_HEADER_IE_ELEMENT_ID_CSL_IE &&
+	    IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT)) {
+		ie_total = IEEE802154_HEADER_IE_HEADER_LENGTH + config->ack_ie.header_ie->length;
+		if (ie_total > sizeof(data->ack_ie.csl_header_ie)) {
+			return -EMSGSIZE;
+		}
+		memcpy(&data->ack_ie.csl_header_ie, config->ack_ie.header_ie, ie_total);
+	} else {
+		return -ENOTSUP;
 	}
-
 	return 0;
 }
 
@@ -2488,6 +2560,36 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 	case IEEE802154_CONFIG_CSMA_CA_BACKOFFS:
 		data->radio_data.csma_ca_backoffs = config->csma_ca_backoffs;
 		return 0;
+
+#if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
+	case IEEE802154_CONFIG_RX_SLOT:
+		sl_rail_scheduler_info_t scheduler_info = {
+			.priority = SL_802154_RADIO_PRIO_BACKGROUND_RX_VALUE,
+			.slip_time = 0,
+			.transaction_time = 0,
+		};
+		sl_rail_scheduled_rx_config_t scheduled_rx_config = {
+			.start = config->rx_slot.start,
+			.start_mode = SL_RAIL_TIME_ABSOLUTE,
+			.end = config->rx_slot.duration,
+			.end_mode = SL_RAIL_TIME_DELAY,
+			/* To stay in schedule Rx state after packet receive. */
+			.rx_transition_end_schedule = 0,
+			/* This lets us receive a packet near a window-end-event */
+			.hard_window_end = 0,
+		};
+		sl_rail_start_scheduled_rx(data->radio_data.rail_handle, data->current_channel,
+					   &scheduled_rx_config, &scheduler_info);
+		return 0;
+
+	case IEEE802154_CONFIG_CSL_PERIOD:
+		data->csl_period_us = config->csl_period;
+		return 0;
+
+	case IEEE802154_CONFIG_EXPECTED_RX_TIME:
+		data->csl_sample_time = config->expected_rx_time;
+		return 0;
+#endif
 
 	default:
 		return -ENOTSUP;

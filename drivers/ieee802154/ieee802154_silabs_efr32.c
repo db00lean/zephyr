@@ -94,7 +94,7 @@ static struct sl_802154_pan_id_layout sl_802154_pan_id_layout_get(struct ieee802
 	return p;
 }
 
-static void sl_802154_load_addr(uint8_t *buffer, uint8_t buffer_len, size_t *length,
+static void sl_802154_load_addr(uint8_t *buffer, size_t buffer_len, size_t *length,
 				enum ieee802154_addressing_mode mode, bool pan_id_present,
 				struct ieee802154_address_field **addr)
 {
@@ -150,7 +150,7 @@ static uint8_t sl_802154_get_aux_sec_hdr_bytes(const struct ieee802154_aux_secur
 	return len;
 }
 
-static void sl_802154_load_mhr(uint8_t *buffer, uint8_t buffer_len, struct ieee802154_mhr *mhr)
+static void sl_802154_load_mhr(uint8_t *buffer, size_t buffer_len, struct ieee802154_mhr *mhr)
 {
 	__ASSERT_NO_MSG(buffer_len > sizeof(struct ieee802154_fcf_seq));
 
@@ -273,8 +273,14 @@ static uint8_t sl_802154_serialize_mhr(uint8_t *buffer, uint8_t buffer_len,
 
 /* IEEE 802.15.4 security level: encryption only = 4, enc+MIC-32 = 5, etc. */
 #define SEC_LEVEL_ENC 4
-/* MIC sizes by security level (level 0–3 and 4–7) */
-static const uint8_t mic_size_table[8] = {0, 4, 8, 16, 0, 4, 8, 16};
+/* MIC sizes by security level (level 0–3 and 4–7); index is AuxHdr security_level (3 bits). */
+static const uint8_t mic_size_table[] = {0, 4, 8, 16, 0, 4, 8, 16};
+
+#define SL_802154_MIC_SIZE_TABLE_LEN ARRAY_SIZE(mic_size_table)
+#define SL_802154_SECURITY_LEVEL_MAX (SL_802154_MIC_SIZE_TABLE_LEN - 1U)
+
+BUILD_ASSERT(SL_802154_MIC_SIZE_TABLE_LEN == 8U,
+	     "802.15.4 security_level is 3 bits (values 0–7)");
 
 void sl_802154_generate_nonce(const uint8_t ext_address[IEEE802154_EXT_ADDR_LENGTH],
 			      uint32_t frame_counter, uint8_t security_level,
@@ -290,7 +296,17 @@ void sl_802154_generate_nonce(const uint8_t ext_address[IEEE802154_EXT_ADDR_LENG
 bool sl_802154_tx_ccm(uint8_t *mpdu, uint16_t mpdu_len, uint8_t header_length,
 		      uint8_t security_level, const uint8_t *key, const uint8_t *nonce)
 {
-	uint8_t tag_length = mic_size_table[security_level & 0x07U];
+	if (security_level > SL_802154_SECURITY_LEVEL_MAX) {
+		return false;
+	}
+
+	uint8_t tag_length = mic_size_table[security_level];
+	uint16_t min_mpdu = (uint16_t)header_length + SL_802154_CRC_BYTES + tag_length;
+
+	if (mpdu_len < min_mpdu) {
+		return false;
+	}
+
 	uint16_t payload_length = mpdu_len - header_length - SL_802154_CRC_BYTES - tag_length;
 	uint8_t *payload = mpdu + header_length;
 	uint8_t *footer = mpdu + mpdu_len - SL_802154_CRC_BYTES - tag_length;
@@ -333,13 +349,13 @@ static int sl_802154_security_get_ack_key(struct silabs_efr32_802154_data *data,
 
 	if (aux == NULL || aux->control.key_id_mode != IEEE802154_KEY_ID_MODE_INDEX) {
 		LOG_WRN("ACK key_id missing or no matching key");
-		return -1;
+		return -EINVAL;
 	}
 
 	frame_key_id = aux->kif.mode_1.key_index;
 	if (frame_key_id == 0) {
 		LOG_WRN("ACK key_id missing or no matching key");
-		return -1;
+		return -EINVAL;
 	}
 
 	if (frame_key_id == data->key_id_prev) {
@@ -353,13 +369,13 @@ static int sl_802154_security_get_ack_key(struct silabs_efr32_802154_data *data,
 		*key_id = data->key_id_next;
 	} else {
 		LOG_WRN("ACK key_id missing or no matching key");
-		return -1;
+		return -ENOENT;
 	}
 
 	*key = data->mac_data.sec_keys[key_slot].key_value;
 	if (*key == NULL) {
 		LOG_WRN("ACK key slot has no key");
-		return -1;
+		return -ENOENT;
 	}
 	return 0;
 }
@@ -368,7 +384,7 @@ static int sl_802154_security_get_non_ack_key(struct silabs_efr32_802154_data *d
 					      const uint8_t **key, uint8_t *key_id)
 {
 	if (data->key_id_current == 0) {
-		return -1;
+		return -EAGAIN;
 	}
 	*key = data->mac_data.sec_keys[SL_802154_MAC_KEY_CURRENT].key_value;
 	*key_id = data->key_id_current;
@@ -410,6 +426,11 @@ static int sl_802154_security_process_tx(struct silabs_efr32_802154_data *data, 
 	aux = mhr->aux_sec;
 	header_length = sl_802154_get_mhr_length(mhr);
 	security_level = mhr->aux_sec->control.security_level;
+
+	if (security_level > SL_802154_SECURITY_LEVEL_MAX) {
+		LOG_WRN("Invalid TX security level %u", (unsigned int)security_level);
+		return -EINVAL;
+	}
 
 	if (!mac_hdr_rdy) {
 		uint32_t fc;
@@ -586,6 +607,11 @@ static int src_match_short_remove(struct silabs_efr32_source_match_data *md, con
 
 	for (uint8_t i = 0; i < md->short_addr_count; i++) {
 		if (md->short_addrs[i] == a) {
+			/* Remove short_addr without shifting the whole array by index.
+			 * If the removed address was not the last one, overwrite
+			 * with the value that used to sit at the end. If the removed
+			 * address was the last one, just decrement the count.
+			 */
 			md->short_addr_count--;
 			if (i != md->short_addr_count) {
 				md->short_addrs[i] = md->short_addrs[md->short_addr_count];
@@ -634,6 +660,11 @@ static int src_match_ext_remove(struct silabs_efr32_source_match_data *md, const
 
 	for (uint8_t i = 0; i < md->ext_addr_count; i++) {
 		if (memcmp(md->ext_addrs[i], addr, IEEE802154_EXT_ADDR_LENGTH) == 0) {
+			/* Remove ext_addr without shifting the whole array by index.
+			 * If the removed address was not the last one, overwrite
+			 * with the value that used to sit at the end. If the removed
+			 * address was the last one, just decrement the count.
+			 */
 			md->ext_addr_count--;
 			if (i != md->ext_addr_count) {
 				memcpy(md->ext_addrs[i], md->ext_addrs[md->ext_addr_count],
@@ -728,14 +759,22 @@ static uint8_t read_initial_pkt_data(struct silabs_efr32_802154_data *data,
 	sl_rail_rx_packet_info_t adjusted_pkt_info;
 	sl_rail_status_t status;
 
-	/* Check if we have enough buffer */
-	__ASSERT_NO_MSG(buffer_len >= expected_data_bytes_max);
+	/* buffer_len is how much of data->rx_buffer may be touched; we may copy up to
+	 * expected_data_bytes_max bytes from the in-flight frame, so buffer_len must be
+	 * >= expected_data_bytes_max or we would overrun the RX buffer.
+	 */
+	if (buffer_len < expected_data_bytes_max) {
+		LOG_WRN("RX buffer too small for peek (%u < %u)", (unsigned int)buffer_len,
+			(unsigned int)expected_data_bytes_max);
+		return 0;
+	}
 
-	/* Read the packet info */
 	status = sl_rail_get_rx_incoming_packet_info(data->radio_data.rail_handle, pkt_info);
-
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
-	(void)status;
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		/* e.g. no packet in progress; same recovery as "not enough bytes yet". */
+		LOG_DBG("get_rx_incoming_packet_info failed: %d", (int)status);
+		return 0;
+	}
 
 	/* We are trying to get the packet info of a packet before it is completely received.
 	 * We do this to evaluate the FP bit in response and add IEs to ACK if needed.
@@ -776,6 +815,17 @@ static uint8_t read_initial_pkt_data(struct silabs_efr32_802154_data *data,
  * Radio implementation: Enhanced ACKs
  */
 
+/* Peek through SecHdr after DATA_REQUEST (worst-case extended src/dst + key id mode 2). */
+#define SL_802154_ENH_ACK_INIT_PEEK_BYTES                                                          \
+	(SL_802154_PHR_BYTES + IEEE802154_FCF_SEQ_LENGTH + IEEE802154_PAN_ID_LENGTH +              \
+	 IEEE802154_EXT_ADDR_LENGTH + IEEE802154_PAN_ID_LENGTH + IEEE802154_EXT_ADDR_LENGTH +      \
+	 IEEE802154_SECURITY_CF_LENGTH + IEEE802154_SECURITY_FRAME_COUNTER_LENGTH +                \
+	 IEEE802154_KEY_ID_FIELD_SRC_8_INDEX_LENGTH)
+
+/* Upper bound passed to read_initial_pkt_data() including optional ACK IE payload. */
+#define SL_802154_ENH_ACK_INIT_PEEK_MAX_BYTES                                                      \
+	(SL_802154_ENH_ACK_INIT_PEEK_BYTES + OT_ACK_IE_MAX_SIZE)
+
 /* Compose one ACK address field (PAN+addr, addr-only, or PAN-only) into out.
  * Address bytes are sourced from rx_addr_field, whose own layout is described
  * by rx_pan_present. Returns bytes written, or 0 on a sizing/argument error.
@@ -787,40 +837,40 @@ static size_t sl_802154_compose_ack_addr_field(uint8_t *out, size_t out_size,
 					       struct ieee802154_address_field *rx_addr_field,
 					       bool rx_pan_present)
 {
-	size_t off = 0;
+	size_t offset = 0;
 
 	if (ack_pan_present) {
 		if (out_size < IEEE802154_PAN_ID_LENGTH) {
 			return 0;
 		}
 		sys_put_le16(ack_pan, out);
-		off += IEEE802154_PAN_ID_LENGTH;
+		offset += IEEE802154_PAN_ID_LENGTH;
 	}
 
 	if (mode == IEEE802154_ADDR_MODE_NONE || rx_addr_field == NULL) {
-		return off;
+		return offset;
 	}
 
-	const struct ieee802154_address *src = rx_pan_present ? &rx_addr_field->plain.addr
-							      : &rx_addr_field->comp.addr;
+	const struct ieee802154_address *src =
+		rx_pan_present ? &rx_addr_field->plain.addr : &rx_addr_field->comp.addr;
 
 	if (mode == IEEE802154_ADDR_MODE_SHORT) {
-		if (out_size - off < IEEE802154_SHORT_ADDR_LENGTH) {
+		if (out_size - offset < IEEE802154_SHORT_ADDR_LENGTH) {
 			return 0;
 		}
-		memcpy(out + off, &src->short_addr, IEEE802154_SHORT_ADDR_LENGTH);
-		off += IEEE802154_SHORT_ADDR_LENGTH;
+		memcpy(out + offset, &src->short_addr, IEEE802154_SHORT_ADDR_LENGTH);
+		offset += IEEE802154_SHORT_ADDR_LENGTH;
 	} else if (mode == IEEE802154_ADDR_MODE_EXTENDED) {
-		if (out_size - off < IEEE802154_EXT_ADDR_LENGTH) {
+		if (out_size - offset < IEEE802154_EXT_ADDR_LENGTH) {
 			return 0;
 		}
-		memcpy(out + off, src->ext_addr, IEEE802154_EXT_ADDR_LENGTH);
-		off += IEEE802154_EXT_ADDR_LENGTH;
+		memcpy(out + offset, src->ext_addr, IEEE802154_EXT_ADDR_LENGTH);
+		offset += IEEE802154_EXT_ADDR_LENGTH;
 	} else {
 		/* Reserved addressing mode: nothing to copy. */
 	}
 
-	return off;
+	return offset;
 }
 
 static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool ie_present)
@@ -903,12 +953,15 @@ static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool
 				       &data->enh_ack_mhr);
 }
 
-/* Return false if we should generate an immediate ACK
- * Return true otherwise
+/* Return false if we should generate an immediate ACK (caller runs FP logic).
+ * Return true if this handler path is finished (caller should return).
+ * @param[out] write_enh_ack_status Result of sl_rail_ieee802154_write_enh_ack when that API
+ *             runs; otherwise SL_RAIL_STATUS_NO_ERROR (including all early-return paths).
  */
 static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
 			       sl_rail_rx_packet_info_t *pkt_info_for_enh_ack,
-			       uint32_t rx_timestamp, uint8_t *initial_pkt_read_bytes)
+			       uint32_t rx_timestamp, uint8_t *initial_pkt_read_bytes,
+			       sl_rail_status_t *write_enh_ack_status)
 {
 	/* RAIL will generate an Immediate ACK for us.
 	 * For an Enhanced ACK, we need to generate the whole packet ourselves.
@@ -924,21 +977,14 @@ static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
 	 * SrcAdr field of Version 0/1 packets, and after receiving through the SecHdr for Version 2
 	 * packets.
 	 */
-	uint8_t expected_bytes =
-		(SL_802154_PHR_BYTES + IEEE802154_FCF_SEQ_LENGTH + IEEE802154_PAN_ID_LENGTH +
-		 IEEE802154_EXT_ADDR_LENGTH + IEEE802154_PAN_ID_LENGTH +
-		 IEEE802154_EXT_ADDR_LENGTH + IEEE802154_SECURITY_CF_LENGTH +
-		 IEEE802154_SECURITY_FRAME_COUNTER_LENGTH +
-		 IEEE802154_KEY_ID_FIELD_SRC_8_INDEX_LENGTH);
-	uint8_t max_expected_bytes_with_ie = expected_bytes + OT_ACK_IE_MAX_SIZE;
-
-	__maybe_unused sl_rail_status_t status;
 	uint8_t enh_ack_mhr_length;
 	uint8_t enh_ack_len;
 
-	*initial_pkt_read_bytes =
-		read_initial_pkt_data(data, pkt_info_for_enh_ack, expected_bytes,
-				      SL_802154_PHR_BYTES + 2, max_expected_bytes_with_ie);
+	*write_enh_ack_status = SL_RAIL_STATUS_NO_ERROR;
+
+	*initial_pkt_read_bytes = read_initial_pkt_data(
+		data, pkt_info_for_enh_ack, SL_802154_ENH_ACK_INIT_PEEK_BYTES,
+		SL_802154_PHR_BYTES + 2, SL_802154_ENH_ACK_INIT_PEEK_MAX_BYTES);
 	if (*initial_pkt_read_bytes == 0) {
 		/* Nothing to read, which means generating an immediate ACK is also pointless */
 		return true;
@@ -1004,21 +1050,28 @@ static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
 	}
 
 	data->enh_ack_buffer[0] = enh_ack_len;
-	status = sl_rail_ieee802154_write_enh_ack(data->radio_data.rail_handle,
-						  data->enh_ack_buffer, enh_ack_len);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	*write_enh_ack_status = sl_rail_ieee802154_write_enh_ack(data->radio_data.rail_handle,
+								 data->enh_ack_buffer, enh_ack_len);
 
 	return true;
 }
 #endif /* (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2) */
 
-static void handle_data_request_command(struct silabs_efr32_802154_data *data)
+/* DATA_REQUEST RAIL hook: enhanced vs immediate ACK and frame-pending.
+ *
+ * Return value:
+ * - When the enhanced-ACK path finishes early: result of sl_rail_ieee802154_write_enh_ack
+ *   (SL_RAIL_STATUS_NO_ERROR if that API was not reached or succeeded).
+ * - Otherwise: result of sl_rail_ieee802154_toggle_frame_pending when invoked, else
+ *   SL_RAIL_STATUS_NO_ERROR.
+ */
+static sl_rail_status_t handle_data_request_command(struct silabs_efr32_802154_data *data)
 {
 	__maybe_unused uint8_t max_expected_bytes = SL_802154_PHR_BYTES + IEEE802154_FCF_SEQ_LENGTH;
 	__maybe_unused uint32_t timestamp = sl_rail_get_time(data->radio_data.rail_handle);
 	uint8_t pkt_offset = SL_802154_PHR_BYTES;
 	sl_rail_rx_packet_info_t pkt_info;
-	sl_rail_status_t status = SL_STATUS_OK;
+	sl_rail_status_t status = SL_RAIL_STATUS_NO_ERROR;
 
 	/* This callback occurs after the address fields of an incoming
 	 * ACK-requesting CMD or DATA frame have been received and we
@@ -1027,13 +1080,16 @@ static void handle_data_request_command(struct silabs_efr32_802154_data *data)
 	 */
 
 	uint8_t initial_pkt_read_bytes;
+	sl_rail_status_t enh_ack_write_status = SL_RAIL_STATUS_NO_ERROR;
 
 	if (!IS_ENABLED(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)) {
-		if (write_enhanced_ack(data, &pkt_info, timestamp, &initial_pkt_read_bytes)) {
-			/* We also return true above if there were failures in
-			 * generating an enhanced ACK.
-			 */
-			return;
+		if (write_enhanced_ack(data, &pkt_info, timestamp, &initial_pkt_read_bytes,
+				       &enh_ack_write_status)) {
+			if (enh_ack_write_status != SL_RAIL_STATUS_NO_ERROR) {
+				LOG_WRN("sl_rail_ieee802154_write_enh_ack failed: %d",
+					(int)enh_ack_write_status);
+			}
+			return enh_ack_write_status;
 		}
 	} else {
 		initial_pkt_read_bytes = read_initial_pkt_data(data, &pkt_info, max_expected_bytes,
@@ -1049,22 +1105,30 @@ static void handle_data_request_command(struct silabs_efr32_802154_data *data)
 		if (src_match_contains(data)) {
 			status = sl_rail_ieee802154_toggle_frame_pending(
 				data->radio_data.rail_handle);
-			__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+			if (status != SL_RAIL_STATUS_NO_ERROR) {
+				LOG_WRN("IEEE802154: toggle_frame_pending failed (%d)",
+					(int)status);
+			}
 			data->mac_data.ack_fpb = true;
 		}
 	} else if ((data->rx_mhr.fs->fc.frame_type != IEEE802154_FRAME_TYPE_DATA) ||
 		   (initial_pkt_read_bytes <= pkt_offset)) {
 		status = sl_rail_ieee802154_toggle_frame_pending(data->radio_data.rail_handle);
-		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+		if (status != SL_RAIL_STATUS_NO_ERROR) {
+			LOG_WRN("IEEE802154: toggle_frame_pending failed (%d)",
+				(int)status);
+		}
 		data->mac_data.ack_fpb = true;
 	} else {
 		/* DATA frame with payload and no soft source match: leave ack_fpb=false. */
 	}
 
 	if (status == SL_RAIL_STATUS_INVALID_STATE) {
-		LOG_WRN("Too late to modify outgoing FP");
+		/* Typical race: ACK already started; other errors are returned without WRN. */
+		LOG_WRN("IEEE802154: too late to modify outgoing frame-pending bit");
 	}
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+
+	return status;
 }
 
 /*************************************************************************************************/
@@ -1306,6 +1370,7 @@ static void handle_rx_pkt(const struct device *dev)
 	status = sl_rail_get_rx_packet_details(data->radio_data.rail_handle, pkt_handle,
 					       &pkt_details);
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_WRN("RX: sl_rail_get_rx_packet_details failed (%d)", (int)status);
 		return;
 	}
 
@@ -1322,6 +1387,7 @@ static void handle_rx_pkt(const struct device *dev)
 
 	status = sl_rail_copy_rx_packet(data->radio_data.rail_handle, data->rx_buffer, &pkt_info);
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_WRN("RX: sl_rail_copy_rx_packet failed (%d)", (int)status);
 		return;
 	}
 
@@ -1407,7 +1473,7 @@ static void silabs_efr32_rail_events_callback(sl_rail_handle_t handle, sl_rail_e
 
 	/* Process data request command events */
 	if ((events & SL_RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND) != 0ULL) {
-		handle_data_request_command(data);
+		(void)handle_data_request_command(data);
 	}
 
 	/* Process TX events */
@@ -1476,6 +1542,8 @@ static void silabs_efr32_rail_events_callback(sl_rail_handle_t handle, sl_rail_e
 }
 
 /*************************************************************************************************/
+
+static int silabs_efr32_set_txpower(const struct device *dev, int16_t dbm);
 
 static int sl_802154_rail_init(const struct device *dev)
 {
@@ -1577,10 +1645,16 @@ static int sl_802154_rail_config(const struct device *dev)
 	}
 
 	status = sl_rail_config_events(data->radio_data.rail_handle, SL_RAIL_EVENTS_ALL, events);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_ERR("sl_rail_config_events failed: %d", (int)status);
+		return -EIO;
+	}
 
 	status = sl_rail_ieee802154_config_2p4_ghz_radio(data->radio_data.rail_handle);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_ERR("sl_rail_ieee802154_config_2p4_ghz_radio failed: %d", (int)status);
+		return -EIO;
+	}
 
 	if (!IS_ENABLED(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)) {
 		sl_rail_transition_time_t rx_to_enh_ack_tx = 256;
@@ -1595,35 +1669,56 @@ static int sl_802154_rail_config(const struct device *dev)
 			(SL_RAIL_IEEE802154_E_OPTION_GB868 | SL_RAIL_IEEE802154_E_OPTION_ENH_ACK),
 			(SL_RAIL_IEEE802154_E_OPTION_GB868 | SL_RAIL_IEEE802154_E_OPTION_ENH_ACK));
 		/* accommodate enhanced ACKs */
-		sl_rail_ieee802154_set_rx_to_enh_ack_tx(data->radio_data.rail_handle,
-							&rx_to_enh_ack_tx);
+		status = sl_rail_ieee802154_set_rx_to_enh_ack_tx(data->radio_data.rail_handle,
+								 &rx_to_enh_ack_tx);
+		if (status != SL_RAIL_STATUS_NO_ERROR) {
+			LOG_ERR("sl_rail_ieee802154_set_rx_to_enh_ack_tx failed: %d", (int)status);
+			return -EIO;
+		}
 	}
 
 	status =
 		sl_rail_util_pa_post_init(data->radio_data.rail_handle, SL_RAIL_TX_PA_MODE_2P4_GHZ);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_ERR("sl_rail_util_pa_post_init failed: %d", (int)status);
+		return -EIO;
+	}
 
 	data->radio_data.rail_initialized = true;
 
-	__ASSERT_NO_MSG(silabs_efr32_set_txpower(dev, 0) == 0);
+	int ret = silabs_efr32_set_txpower(dev, 0);
+
+	if (ret != 0) {
+		LOG_ERR("silabs_efr32_set_txpower failed: %d", ret);
+		return ret;
+	}
 
 	if (IS_ENABLED(CONFIG_PM)) {
 		sl_rail_timer_sync_config_t timer_sync_config = SL_RAIL_TIMER_SYNC_DEFAULT;
 
 		status = sl_rail_config_sleep(data->radio_data.rail_handle, &timer_sync_config);
-		__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+		if (status != SL_RAIL_STATUS_NO_ERROR) {
+			LOG_ERR("sl_rail_config_sleep failed: %d", (int)status);
+			return -EIO;
+		}
 	}
 
 	memset(data->tx_buffer, 0, sizeof(data->tx_buffer));
 
-	sl_rail_config_rx_options(data->radio_data.rail_handle,
-				  SL_RAIL_RX_OPTION_TRACK_ABORTED_FRAMES,
-				  SL_RAIL_RX_OPTION_TRACK_ABORTED_FRAMES);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	status = sl_rail_config_rx_options(data->radio_data.rail_handle,
+					   SL_RAIL_RX_OPTION_TRACK_ABORTED_FRAMES,
+					   SL_RAIL_RX_OPTION_TRACK_ABORTED_FRAMES);
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_ERR("sl_rail_config_rx_options failed: %d", (int)status);
+		return -EIO;
+	}
 
-	sl_rail_ieee802154_config_cca_mode(data->radio_data.rail_handle,
-					   SL_RAIL_IEEE802154_CCA_MODE_RSSI);
-	__ASSERT_NO_MSG(status == SL_RAIL_STATUS_NO_ERROR);
+	status = sl_rail_ieee802154_config_cca_mode(data->radio_data.rail_handle,
+						    SL_RAIL_IEEE802154_CCA_MODE_RSSI);
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
+		LOG_ERR("sl_rail_ieee802154_config_cca_mode failed: %d", (int)status);
+		return -EIO;
+	}
 
 	return 0;
 }
@@ -2356,6 +2451,7 @@ static const struct ieee802154_radio_api silabs_efr32_radio_api = {
 #endif
 };
 
+/* Returns 0 on success, negative errno on failure. */
 static int silabs_efr32_init(const struct device *dev)
 {
 	struct silabs_efr32_802154_data *data = dev->data;
@@ -2363,7 +2459,7 @@ static int silabs_efr32_init(const struct device *dev)
 	int r;
 
 	if (data->radio_data.rail_initialized) {
-		return -EALREADY;
+		return 0;
 	}
 
 	k_sem_init(&data->tx_wait, 0, 1);

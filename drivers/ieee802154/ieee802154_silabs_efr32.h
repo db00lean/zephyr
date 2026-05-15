@@ -42,7 +42,7 @@ enum sl_802154_mac_key_type {
 #define SYMBOLS_PER_ENERGY_READING 8
 #define QUARTER_DBM_IN_DBM         4
 
-struct silabs_efr32_energy_scan_data {
+struct sl_802154_energy_scan_data {
 
 	/* Callback handler of the currently ongoing energy scan.
 	 * It shall be NULL if energy scan is not in progress.
@@ -62,21 +62,20 @@ struct silabs_efr32_energy_scan_data {
 	bool in_progress;
 };
 
-struct silabs_sec_key_buf {
+struct sl_802154_sec_key_buf {
 	uint8_t key_value[IEEE802154_KEY_MAX_LEN];
 	uint8_t key_id;
 };
 
-struct silabs_efr32_mac_data {
+struct sl_802154_mac_data {
 
 	struct ieee802154_key sec_keys[SL_802154_MAC_KEY_COUNT];
 
 	uint32_t ack_fc;
 
-	/* Frame counter. */
 	uint32_t frame_counter;
 
-	struct silabs_sec_key_buf sec_key_storage[SL_802154_MAC_KEY_COUNT];
+	struct sl_802154_sec_key_buf sec_key_storage[SL_802154_MAC_KEY_COUNT];
 
 	uint8_t ack_key_id;
 
@@ -87,7 +86,7 @@ struct silabs_efr32_mac_data {
 	bool ack_seb;
 };
 
-struct silabs_efr32_ack_ie_data {
+struct sl_802154_ack_ie_data {
 
 	uint16_t short_addr;
 
@@ -106,10 +105,11 @@ struct silabs_efr32_ack_ie_data {
  * 0/NULL) and set RX/TX via sl_rail_set_* after init.
  */
 #define SL_802154_RAIL_TX_FIFO_BYTES ((IEEE802154_MAX_PHY_PACKET_SIZE) + (SL_802154_PHR_BYTES))
+#define SL_802154_RAIL_TX_FIFO_ALIGN_COUNT \
+	DIV_ROUND_UP(SL_802154_RAIL_TX_FIFO_BYTES, sizeof(sl_rail_fifo_buffer_align_t))
 
-struct silabs_efr32_radio_data {
-	sl_rail_fifo_buffer_align_t
-		rail_tx_fifo[SL_802154_RAIL_TX_FIFO_BYTES / sizeof(sl_rail_fifo_buffer_align_t)];
+struct sl_802154_radio_data {
+	sl_rail_fifo_buffer_align_t rail_tx_fifo[SL_802154_RAIL_TX_FIFO_ALIGN_COUNT];
 
 	sl_rail_handle_t rail_handle;
 
@@ -128,20 +128,25 @@ struct silabs_efr32_radio_data {
 	bool rail_initialized;
 };
 
-#define SL_802154_SRC_MATCH_SHORT_MAX CONFIG_IEEE802154_SILABS_EFR32_SRC_MATCH_SHORT_MAX
-#define SL_802154_SRC_MATCH_EXT_MAX   CONFIG_IEEE802154_SILABS_EFR32_SRC_MATCH_EXT_MAX
+/* Short and extended addresses used for software frame-pending (FPB).
+ *
+ * This structure may be accessed concurrently with IRQ context: it is
+ * written from the driver's (thread-level) configure path and read
+ * from the RAIL callback path when handling incoming frames and ACK
+ * frame-pending.
+ */
+struct sl_802154_source_match_data {
+	uint16_t short_addrs[CONFIG_IEEE802154_SILABS_EFR32_SRC_MATCH_SHORT_MAX];
 
-struct silabs_efr32_source_match_data {
-	uint16_t short_addrs[SL_802154_SRC_MATCH_SHORT_MAX];
-
-	uint8_t ext_addrs[SL_802154_SRC_MATCH_EXT_MAX][IEEE802154_EXT_ADDR_LENGTH];
+	uint8_t ext_addrs[CONFIG_IEEE802154_SILABS_EFR32_SRC_MATCH_EXT_MAX]
+		[IEEE802154_EXT_ADDR_LENGTH];
 
 	uint8_t short_addr_count;
 
 	uint8_t ext_addr_count;
 };
 
-struct silabs_efr32_802154_config {
+struct sl_802154_config {
 	void (*irq_config_func)(const struct device *dev);
 	/* HFXO worst-case accuracy in ± ppm. Always counted toward
 	 * get_sch_acc because the radio's awake-time timing reference
@@ -157,7 +162,7 @@ struct silabs_efr32_802154_config {
 	uint16_t sleep_clock_accuracy_ppm;
 };
 
-struct silabs_efr32_802154_data {
+struct sl_802154_data {
 	/* Pointer to the network interface. */
 	struct net_if *iface;
 
@@ -181,15 +186,15 @@ struct silabs_efr32_802154_data {
 	struct ieee802154_mhr rx_mhr;
 	struct ieee802154_mhr enh_ack_mhr;
 
-	struct silabs_efr32_radio_data radio_data;
+	struct sl_802154_radio_data radio_data;
 
-	struct silabs_efr32_mac_data mac_data;
+	struct sl_802154_mac_data mac_data;
 
-	struct silabs_efr32_energy_scan_data ed_scan_data;
+	struct sl_802154_energy_scan_data ed_scan_data;
 
-	struct silabs_efr32_ack_ie_data ack_ie;
+	struct sl_802154_ack_ie_data ack_ie;
 
-	struct silabs_efr32_source_match_data match_data;
+	struct sl_802154_source_match_data match_data;
 
 	/* Capabilities of the network interface. */
 	enum ieee802154_hw_caps capabilities;

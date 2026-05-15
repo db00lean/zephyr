@@ -121,8 +121,11 @@ static void sl_802154_load_addr(uint8_t *buffer, size_t buffer_len, size_t *leng
 	/* mode == NONE may still consume a PAN ID slot (Table 7-2 row 2: dst PAN
 	 * present, no dst addr); advance the cursor but expose no addr pointer.
 	 */
-	*addr = (mode == IEEE802154_ADDR_MODE_NONE) ? NULL
-						    : (struct ieee802154_address_field *)buffer;
+	if (mode == IEEE802154_ADDR_MODE_NONE) {
+		*addr = NULL;
+	} else {
+		*addr = (struct ieee802154_address_field *)buffer;
+	}
 }
 
 /* ASH key id field length depends on key_id_mode; sizeof(aux_security_hdr) is wrong. */
@@ -217,16 +220,16 @@ static uint8_t sl_802154_serialize_mhr(uint8_t *buffer, uint8_t buffer_len,
 				       struct ieee802154_mhr *mhr)
 {
 	uint8_t length = 0;
-
-	__ASSERT_NO_MSG(buffer_len >= sizeof(struct ieee802154_fcf_seq));
-	memcpy(buffer, mhr->fs, sizeof(struct ieee802154_fcf_seq));
-	length += sizeof(struct ieee802154_fcf_seq);
-
 	enum ieee802154_addressing_mode da = mhr->fs->fc.dst_addr_mode;
 	enum ieee802154_addressing_mode sa = mhr->fs->fc.src_addr_mode;
 	struct sl_802154_pan_id_layout pl = sl_802154_pan_id_layout_get(mhr->fs);
 	uint8_t dst_size = (pl.dst_pan_present ? IEEE802154_PAN_ID_LENGTH : 0);
 	uint8_t src_size = (pl.src_pan_present ? IEEE802154_PAN_ID_LENGTH : 0);
+	uint8_t ash_size;
+
+	__ASSERT_NO_MSG(buffer_len >= sizeof(struct ieee802154_fcf_seq));
+	memcpy(buffer, mhr->fs, sizeof(struct ieee802154_fcf_seq));
+	length += sizeof(struct ieee802154_fcf_seq);
 
 	if (da == IEEE802154_ADDR_MODE_SHORT) {
 		dst_size += IEEE802154_SHORT_ADDR_LENGTH;
@@ -258,7 +261,7 @@ static uint8_t sl_802154_serialize_mhr(uint8_t *buffer, uint8_t buffer_len,
 	}
 
 	if (mhr->fs->fc.security_enabled && mhr->aux_sec != NULL) {
-		uint8_t ash_size = sl_802154_get_aux_sec_hdr_bytes(mhr->aux_sec);
+		ash_size = sl_802154_get_aux_sec_hdr_bytes(mhr->aux_sec);
 
 		__ASSERT_NO_MSG(buffer_len >= length + ash_size);
 		memcpy(buffer + length, mhr->aux_sec, ash_size);
@@ -282,7 +285,7 @@ static const uint8_t mic_size_table[] = {0, 4, 8, 16, 0, 4, 8, 16};
 BUILD_ASSERT(SL_802154_MIC_SIZE_TABLE_LEN == 8U,
 	     "802.15.4 security_level is 3 bits (values 0–7)");
 
-void sl_802154_generate_nonce(const uint8_t ext_address[IEEE802154_EXT_ADDR_LENGTH],
+static void sl_802154_generate_nonce(const uint8_t ext_address[IEEE802154_EXT_ADDR_LENGTH],
 			      uint32_t frame_counter, uint8_t security_level,
 			      uint8_t nonce[SL_802154_CCM_NONCE_BYTES])
 {
@@ -293,44 +296,41 @@ void sl_802154_generate_nonce(const uint8_t ext_address[IEEE802154_EXT_ADDR_LENG
 	nonce[0] = security_level;
 }
 
-bool sl_802154_tx_ccm(uint8_t *mpdu, uint16_t mpdu_len, uint8_t header_length,
-		      uint8_t security_level, const uint8_t *key, const uint8_t *nonce)
+static int sl_802154_tx_ccm(uint8_t *mpdu, uint16_t mpdu_len, uint8_t header_length,
+			    uint8_t security_level, const uint8_t *key, const uint8_t *nonce)
 {
-	if (security_level > SL_802154_SECURITY_LEVEL_MAX) {
-		return false;
-	}
-
-	uint8_t tag_length = mic_size_table[security_level];
-	uint16_t min_mpdu = (uint16_t)header_length + SL_802154_CRC_BYTES + tag_length;
-
-	if (mpdu_len < min_mpdu) {
-		return false;
-	}
-
-	uint16_t payload_length = mpdu_len - header_length - SL_802154_CRC_BYTES - tag_length;
-	uint8_t *payload = mpdu + header_length;
-	uint8_t *footer = mpdu + mpdu_len - SL_802154_CRC_BYTES - tag_length;
-
-	sli_crypto_descriptor_t key_desc;
+	uint8_t tag_length;
+	uint16_t min_mpdu;
+	uint16_t payload_length;
+	uint8_t *payload;
+	uint8_t *footer;
+	sli_crypto_descriptor_t key_desc =
+		SLI_CRYPTO_DESCRIPTOR_INIT_PLAINTEXT_KEY((uint8_t *)key, OT_MAC_KEY_SIZE);
 	sl_status_t ret;
 
-	key_desc.engine = SLI_CRYPTO_ENGINE_DEFAULT;
-#if defined(LPWAES_PRESENT)
-	key_desc.yield = false;
-#endif
-	key_desc.location = SLI_CRYPTO_KEY_LOCATION_PLAINTEXT;
-	key_desc.key.plaintext_key.buffer.pointer = (uint8_t *)key;
-	key_desc.key.plaintext_key.buffer.size = OT_MAC_KEY_SIZE;
-	key_desc.key.plaintext_key.key_size = OT_MAC_KEY_SIZE;
+	if (security_level > SL_802154_SECURITY_LEVEL_MAX) {
+		return -EINVAL;
+	}
+
+	tag_length = mic_size_table[security_level];
+	min_mpdu = (uint16_t)header_length + SL_802154_CRC_BYTES + tag_length;
+
+	if (mpdu_len < min_mpdu) {
+		return -EINVAL;
+	}
+
+	payload_length = mpdu_len - header_length - SL_802154_CRC_BYTES - tag_length;
+	payload = mpdu + header_length;
+	footer = mpdu + mpdu_len - SL_802154_CRC_BYTES - tag_length;
 
 	ret = sli_crypto_ccm_zigbee(&key_desc, true,
 				    (security_level >= SEC_LEVEL_ENC) ? payload : NULL, payload,
 				    (security_level >= SEC_LEVEL_ENC) ? payload_length : 0, nonce,
 				    mpdu, header_length, footer, tag_length);
-	return (ret == SL_STATUS_OK);
+	return (ret == SL_STATUS_OK) ? 0 : -EIO;
 }
 
-static void sl_802154_security_init(struct silabs_efr32_mac_data *mac_data)
+static void sl_802154_security_init(struct sl_802154_mac_data *mac_data)
 {
 	memset(mac_data->sec_keys, 0, sizeof(mac_data->sec_keys));
 	for (int k = 0; k < ARRAY_SIZE(mac_data->sec_keys); k++) {
@@ -340,7 +340,7 @@ static void sl_802154_security_init(struct silabs_efr32_mac_data *mac_data)
 	}
 }
 
-static int sl_802154_security_get_ack_key(struct silabs_efr32_802154_data *data,
+static int sl_802154_security_get_ack_key(struct sl_802154_data *data,
 					  struct ieee802154_aux_security_hdr *aux,
 					  const uint8_t **key, uint8_t *key_id)
 {
@@ -380,7 +380,7 @@ static int sl_802154_security_get_ack_key(struct silabs_efr32_802154_data *data,
 	return 0;
 }
 
-static int sl_802154_security_get_non_ack_key(struct silabs_efr32_802154_data *data,
+static int sl_802154_security_get_non_ack_key(struct sl_802154_data *data,
 					      const uint8_t **key, uint8_t *key_id)
 {
 	if (data->key_id_current == 0) {
@@ -391,7 +391,7 @@ static int sl_802154_security_get_non_ack_key(struct silabs_efr32_802154_data *d
 	return 0;
 }
 
-static int sl_802154_security_process_tx(struct silabs_efr32_802154_data *data, uint8_t *buffer,
+static int sl_802154_security_process_tx(struct sl_802154_data *data, uint8_t *buffer,
 					 uint8_t len, struct ieee802154_mhr *mhr, bool mac_hdr_rdy)
 {
 	struct ieee802154_aux_security_hdr *aux;
@@ -400,6 +400,7 @@ static int sl_802154_security_process_tx(struct silabs_efr32_802154_data *data, 
 	uint8_t header_length;
 	uint8_t security_level;
 	uint8_t nonce[SL_802154_CCM_NONCE_BYTES];
+	int ccm_ret;
 
 	if (len < IEEE802154_FCF_SEQ_LENGTH) {
 		return -EINVAL;
@@ -454,9 +455,10 @@ static int sl_802154_security_process_tx(struct silabs_efr32_802154_data *data, 
 	}
 
 	sl_802154_generate_nonce(data->ext_addr, aux->frame_counter, security_level, nonce);
-	if (!sl_802154_tx_ccm(buffer, len, header_length, security_level, key, nonce)) {
+	ccm_ret = sl_802154_tx_ccm(buffer, len, header_length, security_level, key, nonce);
+	if (ccm_ret != 0) {
 		LOG_ERR("TX security (AES-CCM) failed");
-		return -EIO;
+		return ccm_ret;
 	}
 	return 0;
 }
@@ -511,7 +513,7 @@ static bool sl_802154_state_is_waiting_for_ack(atomic_t *state)
 
 static void sl_802154_state_clear_tx_data_and_wait_for_ack(atomic_t *state)
 {
-	(void)atomic_and(state, ~(BIT(SL_802154_FLAG_ONGOING_TX_DATA) |
+	atomic_and(state, ~(BIT(SL_802154_FLAG_ONGOING_TX_DATA) |
 				  BIT(SL_802154_FLAG_WAITING_FOR_ACK)));
 }
 
@@ -531,7 +533,7 @@ static void sl_802154_state_clear_tx_data_and_wait_for_ack(atomic_t *state)
  *       the timer read and this call (see silabs_efr32_get_time), otherwise
  *       an ISR observing a later timer value first can cause a spurious wrap.
  */
-static uint64_t us32_to_ns64(uint32_t now_us)
+static uint64_t sl_802154_us32_to_ns64(uint32_t now_us)
 {
 	static uint32_t prev_us;
 	static uint64_t wraps;
@@ -572,7 +574,7 @@ static int sl_802154_idle_radio(sl_rail_handle_t handle)
 static void sl_802154_set_radio_to_idle(sl_rail_handle_t handle)
 {
 	if (sl_rail_get_radio_state(handle) != SL_RAIL_RF_STATE_IDLE) {
-		(void)sl_802154_idle_radio(handle);
+		sl_802154_idle_radio(handle);
 	}
 }
 
@@ -580,30 +582,35 @@ static void sl_802154_set_radio_to_idle(sl_rail_handle_t handle)
 /* Source match table helpers */
 
 /* Source match table helpers. config->ack_fpb.addr is little-endian. */
-static int src_match_short_add(struct silabs_efr32_source_match_data *md, const uint8_t *addr_le)
+static int sl_802154_src_match_short_add(struct sl_802154_source_match_data *md,
+					 const uint8_t *addr_le)
 {
 	unsigned int key = irq_lock();
 	uint16_t a = sys_get_le16(addr_le);
+	int ret = 0;
 
 	for (uint8_t i = 0; i < md->short_addr_count; i++) {
 		if (md->short_addrs[i] == a) {
-			irq_unlock(key);
-			return 0; /* already present */
+			goto exit; /* already present */
 		}
 	}
-	if (md->short_addr_count >= SL_802154_SRC_MATCH_SHORT_MAX) {
-		irq_unlock(key);
-		return -ENOMEM;
+	if (md->short_addr_count >= ARRAY_SIZE(md->short_addrs)) {
+		ret = -ENOMEM;
+		goto exit;
 	}
 	md->short_addrs[md->short_addr_count++] = a;
+
+exit:
 	irq_unlock(key);
-	return 0;
+	return ret;
 }
 
-static int src_match_short_remove(struct silabs_efr32_source_match_data *md, const uint8_t *addr_le)
+static int sl_802154_src_match_short_remove(struct sl_802154_source_match_data *md,
+					    const uint8_t *addr_le)
 {
 	unsigned int key = irq_lock();
 	uint16_t a = sys_get_le16(addr_le);
+	int ret = 0;
 
 	for (uint8_t i = 0; i < md->short_addr_count; i++) {
 		if (md->short_addrs[i] == a) {
@@ -616,15 +623,17 @@ static int src_match_short_remove(struct silabs_efr32_source_match_data *md, con
 			if (i != md->short_addr_count) {
 				md->short_addrs[i] = md->short_addrs[md->short_addr_count];
 			}
-			irq_unlock(key);
-			return 0;
+			goto exit;
 		}
 	}
+	ret = -ENOENT;
+
+exit:
 	irq_unlock(key);
-	return -ENOENT;
+	return ret;
 }
 
-static void src_match_short_clear(struct silabs_efr32_source_match_data *md)
+static void sl_802154_src_match_short_clear(struct sl_802154_source_match_data *md)
 {
 	unsigned int key = irq_lock();
 
@@ -632,7 +641,7 @@ static void src_match_short_clear(struct silabs_efr32_source_match_data *md)
 	irq_unlock(key);
 }
 
-static int src_match_ext_add(struct silabs_efr32_source_match_data *md, const uint8_t *addr)
+static int sl_802154_src_match_ext_add(struct sl_802154_source_match_data *md, const uint8_t *addr)
 {
 	unsigned int key = irq_lock();
 	int ret = 0;
@@ -642,7 +651,7 @@ static int src_match_ext_add(struct silabs_efr32_source_match_data *md, const ui
 			goto exit;
 		}
 	}
-	if (md->ext_addr_count >= SL_802154_SRC_MATCH_EXT_MAX) {
+	if (md->ext_addr_count >= ARRAY_SIZE(md->ext_addrs)) {
 		ret = -ENOMEM;
 		goto exit;
 	}
@@ -653,7 +662,8 @@ exit:
 	return ret;
 }
 
-static int src_match_ext_remove(struct silabs_efr32_source_match_data *md, const uint8_t *addr)
+static int sl_802154_src_match_ext_remove(struct sl_802154_source_match_data *md,
+					  const uint8_t *addr)
 {
 	unsigned int key = irq_lock();
 	int ret = 0;
@@ -680,7 +690,7 @@ exit:
 	return ret;
 }
 
-static void src_match_ext_clear(struct silabs_efr32_source_match_data *md)
+static void sl_802154_src_match_ext_clear(struct sl_802154_source_match_data *md)
 {
 	unsigned int key = irq_lock();
 
@@ -689,7 +699,8 @@ static void src_match_ext_clear(struct silabs_efr32_source_match_data *md)
 }
 
 /* Used from DATA_REQUEST_COMMAND handler to decide if we set FP in the outgoing ACK. */
-static bool src_match_short_contains(struct silabs_efr32_source_match_data *md, uint16_t short_addr)
+static bool sl_802154_src_match_short_contains(struct sl_802154_source_match_data *md,
+					       uint16_t short_addr)
 {
 	unsigned int key = irq_lock();
 	bool found = false;
@@ -697,15 +708,15 @@ static bool src_match_short_contains(struct silabs_efr32_source_match_data *md, 
 	for (uint8_t i = 0; i < md->short_addr_count; i++) {
 		if (md->short_addrs[i] == short_addr) {
 			found = true;
-			goto exit;
+			break;
 		}
 	}
-exit:
 	irq_unlock(key);
 	return found;
 }
 
-static bool src_match_ext_contains(struct silabs_efr32_source_match_data *md, const uint8_t *addr)
+static bool sl_802154_src_match_ext_contains(struct sl_802154_source_match_data *md,
+					     const uint8_t *addr)
 {
 	unsigned int key = irq_lock();
 	bool found = false;
@@ -713,17 +724,16 @@ static bool src_match_ext_contains(struct silabs_efr32_source_match_data *md, co
 	for (uint8_t i = 0; i < md->ext_addr_count; i++) {
 		if (memcmp(md->ext_addrs[i], addr, 8) == 0) {
 			found = true;
-			goto exit;
+			break;
 		}
 	}
-exit:
 	irq_unlock(key);
 	return found;
 }
 
-static bool src_match_contains(struct silabs_efr32_802154_data *data)
+static bool sl_802154_src_match_contains(struct sl_802154_data *data)
 {
-	struct silabs_efr32_source_match_data *md = &data->match_data;
+	struct sl_802154_source_match_data *md = &data->match_data;
 	sl_rail_ieee802154_address_t src_addr;
 	bool match = false;
 
@@ -737,9 +747,9 @@ static bool src_match_contains(struct silabs_efr32_802154_data *data)
 	}
 
 	if (src_addr.address_length == SL_RAIL_IEEE802154_SHORT_ADDRESS) {
-		match = src_match_short_contains(md, src_addr.short_address);
+		match = sl_802154_src_match_short_contains(md, src_addr.short_address);
 	} else if (src_addr.address_length == SL_RAIL_IEEE802154_LONG_ADDRESS) {
-		match = src_match_ext_contains(md, src_addr.long_address);
+		match = sl_802154_src_match_ext_contains(md, src_addr.long_address);
 	} else {
 		/* No address configured: leave match=false. */
 	}
@@ -751,10 +761,16 @@ exit:
 /*************************************************************************************************/
 /* Packet Processing */
 
-static uint8_t read_initial_pkt_data(struct silabs_efr32_802154_data *data,
-				     sl_rail_rx_packet_info_t *pkt_info,
-				     uint8_t expected_data_bytes_max,
-				     uint8_t expected_data_bytes_min, uint8_t buffer_len)
+/* Peek the in-progress RX frame into data->rx_buffer and parse MHR.
+ *
+ * @return Positive: total packet bytes captured for peek (includes PHR).
+ *         0: frame not ready or RAIL has no incoming packet info.
+ *         -EINVAL: @p buffer_len is smaller than @p expected_data_bytes_max.
+ */
+static int read_initial_pkt_data(struct sl_802154_data *data,
+				 sl_rail_rx_packet_info_t *pkt_info,
+				 size_t expected_data_bytes_max,
+				 size_t expected_data_bytes_min, size_t buffer_len)
 {
 	sl_rail_rx_packet_info_t adjusted_pkt_info;
 	sl_rail_status_t status;
@@ -764,9 +780,9 @@ static uint8_t read_initial_pkt_data(struct silabs_efr32_802154_data *data,
 	 * >= expected_data_bytes_max or we would overrun the RX buffer.
 	 */
 	if (buffer_len < expected_data_bytes_max) {
-		LOG_WRN("RX buffer too small for peek (%u < %u)", (unsigned int)buffer_len,
-			(unsigned int)expected_data_bytes_max);
-		return 0;
+		LOG_WRN("RX buffer too small for peek (%zu < %zu)", buffer_len,
+			expected_data_bytes_max);
+		return -EINVAL;
 	}
 
 	status = sl_rail_get_rx_incoming_packet_info(data->radio_data.rail_handle, pkt_info);
@@ -806,8 +822,9 @@ static uint8_t read_initial_pkt_data(struct silabs_efr32_802154_data *data,
 	(void)sl_rail_copy_rx_packet(data->radio_data.rail_handle, data->rx_buffer,
 				     &adjusted_pkt_info);
 	sl_802154_load_mhr(&data->rx_buffer[SL_802154_PHR_BYTES],
-			   adjusted_pkt_info.packet_bytes - SL_802154_PHR_BYTES, &data->rx_mhr);
-	return (uint8_t)adjusted_pkt_info.packet_bytes;
+			   (size_t)(adjusted_pkt_info.packet_bytes - SL_802154_PHR_BYTES),
+			   &data->rx_mhr);
+	return (int)adjusted_pkt_info.packet_bytes;
 }
 
 #if (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)
@@ -873,7 +890,7 @@ static size_t sl_802154_compose_ack_addr_field(uint8_t *out, size_t out_size,
 	return offset;
 }
 
-static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool ie_present)
+static uint8_t construct_enh_ack_mhr(struct sl_802154_data *data, bool ie_present)
 {
 	/* construct data->enh_ack_mhr */
 	struct ieee802154_fcf_seq enh_ack_fs = {
@@ -890,15 +907,19 @@ static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool
 		},
 		.sequence = data->rx_mhr.fs->sequence,
 	};
-
 	struct ieee802154_aux_security_hdr enh_sec_hdr = {};
+	struct sl_802154_pan_id_layout ack_pl;
+	struct sl_802154_pan_id_layout rx_pl;
+	uint16_t ack_dst_pan;
+	uint16_t ack_src_pan;
+	uint8_t ack_dst_field[IEEE802154_PAN_ID_LENGTH + IEEE802154_EXT_ADDR_LENGTH];
+	uint8_t ack_src_field[IEEE802154_PAN_ID_LENGTH + IEEE802154_EXT_ADDR_LENGTH];
 
 	if (data->rx_mhr.fs->fc.security_enabled) {
-		struct ieee802154_security_control_field scf = {
+		enh_sec_hdr.control = (struct ieee802154_security_control_field){
 			.security_level = data->rx_mhr.aux_sec->control.security_level,
 			.key_id_mode = data->rx_mhr.aux_sec->control.key_id_mode,
 		};
-		enh_sec_hdr.control = scf;
 		/* Will set later in sl_802154_security_process_tx */
 		enh_sec_hdr.frame_counter = 0;
 
@@ -912,10 +933,10 @@ static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool
 	 * even when address modes are swapped and pan_id_comp is preserved.
 	 * PAN ID lookups assume single-PAN networks (true for Thread).
 	 */
-	struct sl_802154_pan_id_layout ack_pl = sl_802154_pan_id_layout_get(&enh_ack_fs);
-	struct sl_802154_pan_id_layout rx_pl = sl_802154_pan_id_layout_get(data->rx_mhr.fs);
-	uint16_t ack_dst_pan = data->pan_id;
-	uint16_t ack_src_pan = data->pan_id;
+	ack_pl = sl_802154_pan_id_layout_get(&enh_ack_fs);
+	rx_pl = sl_802154_pan_id_layout_get(data->rx_mhr.fs);
+	ack_dst_pan = data->pan_id;
+	ack_src_pan = data->pan_id;
 
 	if (data->rx_mhr.src_addr != NULL && rx_pl.src_pan_present) {
 		ack_dst_pan = data->rx_mhr.src_addr->plain.pan_id;
@@ -927,9 +948,6 @@ static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool
 	if (data->rx_mhr.dst_addr != NULL && rx_pl.dst_pan_present) {
 		ack_src_pan = data->rx_mhr.dst_addr->plain.pan_id;
 	}
-
-	uint8_t ack_dst_field[IEEE802154_PAN_ID_LENGTH + IEEE802154_EXT_ADDR_LENGTH];
-	uint8_t ack_src_field[IEEE802154_PAN_ID_LENGTH + IEEE802154_EXT_ADDR_LENGTH];
 
 	(void)sl_802154_compose_ack_addr_field(ack_dst_field, sizeof(ack_dst_field),
 					       enh_ack_fs.fc.dst_addr_mode,
@@ -953,16 +971,27 @@ static uint8_t construct_enh_ack_mhr(struct silabs_efr32_802154_data *data, bool
 				       &data->enh_ack_mhr);
 }
 
-/* Return false if we should generate an immediate ACK (caller runs FP logic).
- * Return true if this handler path is finished (caller should return).
+/* Return 0 if the caller should continue with immediate ACK / frame-pending logic.
+ * Return non-zero if this handler path is finished; the caller should then return
+ * the status stored in @p write_enh_ack_status (from sl_rail_ieee802154_write_enh_ack when
+ * that API runs).
  * @param[out] write_enh_ack_status Result of sl_rail_ieee802154_write_enh_ack when that API
  *             runs; otherwise SL_RAIL_STATUS_NO_ERROR (including all early-return paths).
  */
-static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
-			       sl_rail_rx_packet_info_t *pkt_info_for_enh_ack,
-			       uint32_t rx_timestamp, uint8_t *initial_pkt_read_bytes,
-			       sl_rail_status_t *write_enh_ack_status)
+static int write_enhanced_ack(struct sl_802154_data *data,
+			      sl_rail_rx_packet_info_t *pkt_info_for_enh_ack,
+			      uint32_t rx_timestamp, size_t *initial_pkt_read_bytes,
+			      sl_rail_status_t *write_enh_ack_status)
 {
+	uint8_t enh_ack_mhr_length;
+	uint8_t enh_ack_len;
+	bool ie_present;
+	bool match;
+	struct sl_802154_pan_id_layout pl;
+	struct ieee802154_address *src_addr;
+	uint16_t short_addr;
+	int peek_rc;
+
 	/* RAIL will generate an Immediate ACK for us.
 	 * For an Enhanced ACK, we need to generate the whole packet ourselves.
 	 */
@@ -977,48 +1006,55 @@ static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
 	 * SrcAdr field of Version 0/1 packets, and after receiving through the SecHdr for Version 2
 	 * packets.
 	 */
-	uint8_t enh_ack_mhr_length;
-	uint8_t enh_ack_len;
-
 	*write_enh_ack_status = SL_RAIL_STATUS_NO_ERROR;
 
-	*initial_pkt_read_bytes = read_initial_pkt_data(
-		data, pkt_info_for_enh_ack, SL_802154_ENH_ACK_INIT_PEEK_BYTES,
-		SL_802154_PHR_BYTES + 2, SL_802154_ENH_ACK_INIT_PEEK_MAX_BYTES);
-	if (*initial_pkt_read_bytes == 0) {
+	peek_rc = read_initial_pkt_data(data, pkt_info_for_enh_ack,
+					(size_t)SL_802154_ENH_ACK_INIT_PEEK_BYTES,
+					(size_t)SL_802154_PHR_BYTES + 2U,
+					(size_t)SL_802154_ENH_ACK_INIT_PEEK_MAX_BYTES);
+	if (peek_rc > 0) {
+		*initial_pkt_read_bytes = (size_t)peek_rc;
+	} else {
+		*initial_pkt_read_bytes = 0U;
+	}
+	if (*initial_pkt_read_bytes == 0U) {
 		/* Nothing to read, which means generating an immediate ACK is also pointless */
-		return true;
+		return 1;
 	}
 
 	if (data->rx_mhr.fs->fc.frame_version != IEEE802154_VERSION_802154) {
-		return false;
+		return 0;
 	}
 
 	data->mac_data.ack_fpb = false;
-	bool ie_present = false;
+	ie_present = false;
 
 	if (data->is_src_match_enabled) {
-		bool match = false;
-		struct sl_802154_pan_id_layout pl = sl_802154_pan_id_layout_get(data->rx_mhr.fs);
-		struct ieee802154_address *src_addr = pl.src_pan_present
-							      ? &data->rx_mhr.src_addr->plain.addr
-							      : &data->rx_mhr.src_addr->comp.addr;
+		match = false;
+		pl = sl_802154_pan_id_layout_get(data->rx_mhr.fs);
+
+		if (pl.src_pan_present) {
+			src_addr = &data->rx_mhr.src_addr->plain.addr;
+		} else {
+			src_addr = &data->rx_mhr.src_addr->comp.addr;
+		}
 		if (data->rx_mhr.fs->fc.src_addr_mode == IEEE802154_ADDR_MODE_SHORT) {
 			/* Frame addresses are little endian (see ieee802154_mac.h) */
-			uint16_t short_addr = sys_get_le16((uint8_t *)&src_addr->short_addr);
+			short_addr = sys_get_le16((uint8_t *)&src_addr->short_addr);
 
 			data->mac_data.ack_fpb =
-				src_match_short_contains(&data->match_data, short_addr);
+				sl_802154_src_match_short_contains(&data->match_data, short_addr);
 			match = (data->ack_ie.short_addr < IEEE802154_NO_SHORT_ADDRESS_ASSIGNED &&
 				 data->ack_ie.short_addr == short_addr);
 		} else {
 			data->mac_data.ack_fpb =
-				src_match_ext_contains(&data->match_data, src_addr->ext_addr);
+				sl_802154_src_match_ext_contains(&data->match_data,
+								 src_addr->ext_addr);
 			match = (memcmp(data->ack_ie.ext_addr, src_addr->ext_addr,
 					IEEE802154_EXT_ADDR_LENGTH) == 0);
 		}
 		if (!match) {
-			return true; /* requested ack IE address does not match */
+			return 1; /* requested ack IE address does not match */
 		}
 	}
 
@@ -1045,7 +1081,7 @@ static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
 		if (sl_802154_security_process_tx(data, data->enh_ack_buffer, enh_ack_len,
 						  &data->enh_ack_mhr, false) < 0) {
 			/* Skip writing a malformed ACK; peer will retransmit. */
-			return true;
+			return 1;
 		}
 	}
 
@@ -1053,7 +1089,7 @@ static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
 	*write_enh_ack_status = sl_rail_ieee802154_write_enh_ack(data->radio_data.rail_handle,
 								 data->enh_ack_buffer, enh_ack_len);
 
-	return true;
+	return 1;
 }
 #endif /* (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2) */
 
@@ -1065,11 +1101,12 @@ static bool write_enhanced_ack(struct silabs_efr32_802154_data *data,
  * - Otherwise: result of sl_rail_ieee802154_toggle_frame_pending when invoked, else
  *   SL_RAIL_STATUS_NO_ERROR.
  */
-static sl_rail_status_t handle_data_request_command(struct silabs_efr32_802154_data *data)
+static sl_rail_status_t handle_data_request_command(struct sl_802154_data *data)
 {
-	__maybe_unused uint8_t max_expected_bytes = SL_802154_PHR_BYTES + IEEE802154_FCF_SEQ_LENGTH;
+	const size_t pkt_offset = SL_802154_PHR_BYTES;
+	const size_t max_expected_bytes =
+		(size_t)SL_802154_PHR_BYTES + (size_t)IEEE802154_FCF_SEQ_LENGTH;
 	__maybe_unused uint32_t timestamp = sl_rail_get_time(data->radio_data.rail_handle);
-	uint8_t pkt_offset = SL_802154_PHR_BYTES;
 	sl_rail_rx_packet_info_t pkt_info;
 	sl_rail_status_t status = SL_RAIL_STATUS_NO_ERROR;
 
@@ -1079,12 +1116,12 @@ static sl_rail_status_t handle_data_request_command(struct silabs_efr32_802154_d
 	 * kind of ACK is being requested -- Immediate or Enhanced.
 	 */
 
-	uint8_t initial_pkt_read_bytes;
+	size_t initial_pkt_read_bytes = 0U;
 	sl_rail_status_t enh_ack_write_status = SL_RAIL_STATUS_NO_ERROR;
 
 	if (!IS_ENABLED(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)) {
 		if (write_enhanced_ack(data, &pkt_info, timestamp, &initial_pkt_read_bytes,
-				       &enh_ack_write_status)) {
+				       &enh_ack_write_status) != 0) {
 			if (enh_ack_write_status != SL_RAIL_STATUS_NO_ERROR) {
 				LOG_WRN("sl_rail_ieee802154_write_enh_ack failed: %d",
 					(int)enh_ack_write_status);
@@ -1092,8 +1129,14 @@ static sl_rail_status_t handle_data_request_command(struct silabs_efr32_802154_d
 			return enh_ack_write_status;
 		}
 	} else {
-		initial_pkt_read_bytes = read_initial_pkt_data(data, &pkt_info, max_expected_bytes,
-							       pkt_offset + 2, max_expected_bytes);
+		int peek_rc = read_initial_pkt_data(data, &pkt_info, max_expected_bytes,
+						    pkt_offset + 2U, max_expected_bytes);
+
+		if (peek_rc > 0) {
+			initial_pkt_read_bytes = (size_t)peek_rc;
+		} else {
+			initial_pkt_read_bytes = 0U;
+		}
 	}
 
 	/* Calculate frame pending for immediate-ACK
@@ -1102,7 +1145,7 @@ static sl_rail_status_t handle_data_request_command(struct silabs_efr32_802154_d
 	data->mac_data.ack_fpb = false;
 
 	if (data->is_src_match_enabled) {
-		if (src_match_contains(data)) {
+		if (sl_802154_src_match_contains(data)) {
 			status = sl_rail_ieee802154_toggle_frame_pending(
 				data->radio_data.rail_handle);
 			if (status != SL_RAIL_STATUS_NO_ERROR) {
@@ -1134,13 +1177,13 @@ static sl_rail_status_t handle_data_request_command(struct silabs_efr32_802154_d
 /*************************************************************************************************/
 /* Radio Event Processing */
 
-static void handle_tx_failed(struct silabs_efr32_802154_data *data)
+static void handle_tx_failed(struct sl_802154_data *data)
 {
 	sl_802154_state_clear_tx_data_and_wait_for_ack(&data->radio_data.state);
 	sl_802154_yield_radio(data->radio_data.rail_handle);
 }
 
-static void handle_ack_timeout(struct silabs_efr32_802154_data *data)
+static void handle_ack_timeout(struct sl_802154_data *data)
 {
 	__ASSERT_NO_MSG(sl_802154_state_is_tx_data_ongoing(&data->radio_data.state));
 	__ASSERT_NO_MSG(sl_802154_state_is_waiting_for_ack(&data->radio_data.state));
@@ -1154,7 +1197,7 @@ static void handle_ack_timeout(struct silabs_efr32_802154_data *data)
 
 static void handle_rx_failed(const struct device *dev, enum ieee802154_rx_fail_reason reason)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 
 	if (data->event_handler != NULL) {
 		data->event_handler(dev, IEEE802154_EVENT_RX_FAILED, (void *)&reason);
@@ -1167,13 +1210,17 @@ static bool validate_phr(const sl_rail_rx_packet_info_t *pkt_info, uint16_t pkt_
 		return pkt_length == pkt_info->p_first_portion_data[0];
 	}
 
-	uint8_t length_byte = (pkt_info->first_portion_bytes > 1)
-				      ? pkt_info->p_first_portion_data[1]
-				      : pkt_info->p_last_portion_data[0];
+	uint8_t length_byte;
+
+	if (pkt_info->first_portion_bytes > 1) {
+		length_byte = pkt_info->p_first_portion_data[1];
+	} else {
+		length_byte = pkt_info->p_last_portion_data[0];
+	}
 	return pkt_length == (uint16_t)(__RBIT(length_byte) >> 24);
 }
 
-static bool validate_pkt(struct silabs_efr32_802154_data *data, sl_rail_rx_packet_info_t *pkt_info,
+static bool sl_802154_is_valid_pkt(struct sl_802154_data *data, sl_rail_rx_packet_info_t *pkt_info,
 			 sl_rail_rx_packet_details_t *pkt_details, uint16_t pkt_length)
 {
 	bool valid = false;
@@ -1230,7 +1277,7 @@ exit:
 static void handle_rx_ack(const struct device *dev, uint16_t length,
 			  sl_rail_rx_packet_details_t *pkt_details)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	struct net_pkt *ack_pkt = NULL;
 	bool seq_match;
 	bool valid_ack;
@@ -1247,7 +1294,7 @@ static void handle_rx_ack(const struct device *dev, uint16_t length,
 		    data->tx_mhr.fs->fc.ar && seq_match;
 
 	if (!valid_ack) {
-		goto exit;
+		goto invalid_ack;
 	}
 
 	/* allocate ack packet */
@@ -1255,20 +1302,21 @@ static void handle_rx_ack(const struct device *dev, uint16_t length,
 	if (!ack_pkt) {
 		LOG_ERR("No free packet available.");
 		handle_rx_failed(dev, IEEE802154_RX_FAIL_OTHER);
-		goto exit;
+		goto ack_alloc_fail;
 	}
 
 	/* update packet data */
 	if (net_pkt_write(ack_pkt, data->rx_buffer, length) < 0) {
 		LOG_ERR("Failed to write to a packet.");
-		goto exit;
+		goto ack_write_fail;
 	}
 
 	/* update RSSI and LQI */
 	net_pkt_set_ieee802154_lqi(ack_pkt, pkt_details->lqi);
 	net_pkt_set_ieee802154_rssi_dbm(ack_pkt, pkt_details->rssi_dbm);
 	/* set timestamp of the ACK packet */
-	net_pkt_set_timestamp_ns(ack_pkt, us32_to_ns64(pkt_details->time_received.packet_time));
+	net_pkt_set_timestamp_ns(ack_pkt,
+				 sl_802154_us32_to_ns64(pkt_details->time_received.packet_time));
 
 	net_pkt_cursor_init(ack_pkt);
 
@@ -1277,10 +1325,11 @@ static void handle_rx_ack(const struct device *dev, uint16_t length,
 		LOG_INF("ACK packet not handled - releasing.");
 	}
 
-exit:
+ack_write_fail:
 	if (ack_pkt != NULL) {
 		net_pkt_unref(ack_pkt);
 	}
+ack_alloc_fail:
 	if (valid_ack) {
 		k_sem_give(&data->ack_wait);
 		data->tx_errno = 0;
@@ -1289,6 +1338,7 @@ exit:
 			data->mac_data.em_pending_data = true;
 		}
 	}
+invalid_ack:
 	if (!tx_is_data_request) {
 		sl_802154_yield_radio(data->radio_data.rail_handle);
 	}
@@ -1297,8 +1347,9 @@ exit:
 static void handle_rx_data(const struct device *dev, uint16_t length,
 			   sl_rail_rx_packet_details_t *pkt_details)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	struct net_pkt *pkt;
+	int net_status;
 
 	if (!data->promiscuous && length < 4) {
 		return;
@@ -1322,10 +1373,11 @@ static void handle_rx_data(const struct device *dev, uint16_t length,
 	net_pkt_set_ieee802154_ack_fpb(pkt, data->mac_data.ack_fpb);
 	net_pkt_set_ieee802154_ack_fc(pkt, data->mac_data.ack_fc);
 	net_pkt_set_ieee802154_ack_keyid(pkt, data->mac_data.ack_key_id);
-	net_pkt_set_timestamp_ns(pkt, us32_to_ns64(pkt_details->time_received.packet_time));
+	net_pkt_set_timestamp_ns(pkt,
+				 sl_802154_us32_to_ns64(pkt_details->time_received.packet_time));
 	net_pkt_cursor_init(pkt);
 
-	int net_status = net_recv_data(data->iface, pkt);
+	net_status = net_recv_data(data->iface, pkt);
 
 	if (net_status < 0) {
 		LOG_ERR("RCV Packet dropped by NET stack: %d", net_status);
@@ -1353,7 +1405,7 @@ static void handle_rx_data(const struct device *dev, uint16_t length,
  */
 static void handle_rx_pkt(const struct device *dev)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_status_t status;
 	sl_rail_rx_packet_info_t pkt_info;
 	sl_rail_rx_packet_details_t pkt_details;
@@ -1381,7 +1433,7 @@ static void handle_rx_pkt(const struct device *dev)
 	 */
 	pkt_length = pkt_info.packet_bytes + SL_802154_CRC_BYTES - SL_802154_PHR_BYTES;
 
-	if (!validate_pkt(data, &pkt_info, &pkt_details, pkt_length)) {
+	if (!sl_802154_is_valid_pkt(data, &pkt_info, &pkt_details, pkt_length)) {
 		return;
 	}
 
@@ -1401,36 +1453,38 @@ static void handle_rx_pkt(const struct device *dev)
 	}
 }
 
-static void handle_scheduler_event(struct silabs_efr32_802154_data *data)
+static void handle_scheduler_event(struct sl_802154_data *data)
 {
 	sl_rail_scheduler_status_t scheduler_status;
 	sl_rail_status_t rail_status;
 
 	sl_rail_get_scheduler_status(data->radio_data.rail_handle, &scheduler_status, &rail_status);
-	if (scheduler_status != SL_RAIL_SCHEDULER_STATUS_NO_ERROR) {
-		if (sl_802154_state_is_tx_ack_ongoing(&data->radio_data.state)) {
-			sl_802154_state_set_tx_ack_ongoing(&data->radio_data.state, false);
-		}
-		/* We were in the process of TXing a data frame, treat it as a CCA_FAIL. */
-		if (sl_802154_state_is_tx_data_ongoing(&data->radio_data.state)) {
-			data->tx_errno = -EBUSY;
-			k_sem_give(&data->tx_wait);
-			handle_tx_failed(data);
+	if (scheduler_status == SL_RAIL_SCHEDULER_STATUS_NO_ERROR) {
+		return;
+	}
 
-			/* We are waiting for an ACK: we will never get the ACK we were waiting for.
-			 * We want to yield the radio only if the PACKET_SENT event
-			 * already fired.
-			 */
-			if (sl_802154_state_is_waiting_for_ack(&data->radio_data.state)) {
-				handle_ack_timeout(data);
-			}
+	if (sl_802154_state_is_tx_ack_ongoing(&data->radio_data.state)) {
+		sl_802154_state_set_tx_ack_ongoing(&data->radio_data.state, false);
+	}
+	/* We were in the process of TXing a data frame, treat it as a CCA_FAIL. */
+	if (sl_802154_state_is_tx_data_ongoing(&data->radio_data.state)) {
+		data->tx_errno = -EBUSY;
+		k_sem_give(&data->tx_wait);
+		handle_tx_failed(data);
+
+		/* We are waiting for an ACK: we will never get the ACK we were waiting for.
+		 * We want to yield the radio only if the PACKET_SENT event
+		 * already fired.
+		 */
+		if (sl_802154_state_is_waiting_for_ack(&data->radio_data.state)) {
+			handle_ack_timeout(data);
 		}
 	}
 }
 
-static void handle_tx_completion(struct silabs_efr32_802154_data *data, sl_rail_events_t events)
+static void handle_tx_completion(struct sl_802154_data *data, sl_rail_events_t events)
 {
-	if ((events & SL_RAIL_EVENT_TX_PACKET_SENT) != 0ULL) {
+	if (events & SL_RAIL_EVENT_TX_PACKET_SENT) {
 		if (sl_802154_state_is_tx_data_ongoing(&data->radio_data.state)) {
 			if (data->tx_mhr.fs->fc.ar) {
 				sl_802154_state_set_waiting_for_ack(&data->radio_data.state, true);
@@ -1441,23 +1495,23 @@ static void handle_tx_completion(struct silabs_efr32_802154_data *data, sl_rail_
 			}
 		}
 	}
-	if ((events & SL_RAIL_EVENT_TX_CHANNEL_BUSY) != 0ULL) {
+	if (events & SL_RAIL_EVENT_TX_CHANNEL_BUSY) {
 		data->tx_errno = -EBUSY;
 		handle_tx_failed(data);
 	}
-	if ((events & SL_RAIL_EVENT_TX_BLOCKED) != 0ULL) {
+	if (events & SL_RAIL_EVENT_TX_BLOCKED) {
 		data->tx_errno = -EIO;
 		handle_tx_failed(data);
 	}
-	if ((events & (SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_TX_ABORTED)) != 0ULL) {
+	if (events & (SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_TX_ABORTED)) {
 		data->tx_errno = -EIO;
 		handle_tx_failed(data);
 	}
 	/* STARTED takes precedence: a scheduled TX that started should not be reported as missed
 	 * even if RAIL coalesces both bits in the same callback.
 	 */
-	if ((events & SL_RAIL_EVENT_TX_SCHEDULED_TX_MISSED) != 0ULL &&
-	    (events & SL_RAIL_EVENT_TX_SCHEDULED_TX_STARTED) == 0ULL) {
+	if ((events & SL_RAIL_EVENT_TX_SCHEDULED_TX_MISSED) &&
+	    !(events & SL_RAIL_EVENT_TX_SCHEDULED_TX_STARTED)) {
 		data->tx_errno = -EIO;
 		handle_tx_failed(data);
 	}
@@ -1469,10 +1523,10 @@ static void silabs_efr32_rail_events_callback(sl_rail_handle_t handle, sl_rail_e
 {
 	const sl_rail_config_t *rail_config = sl_rail_get_config(handle);
 	const struct device *dev = rail_config->p_opaque_handle_0;
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 
 	/* Process data request command events */
-	if ((events & SL_RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND) != 0ULL) {
+	if (events & SL_RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND) {
 		(void)handle_data_request_command(data);
 	}
 
@@ -1547,25 +1601,21 @@ static int silabs_efr32_set_txpower(const struct device *dev, int16_t dbm);
 
 static int sl_802154_rail_init(const struct device *dev)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_status_t status;
 	sl_rail_handle_t handle = SL_RAIL_EFR32_HANDLE;
-	sl_rail_config_t rail_config = {0};
-
-	/* Stash dev/data in RAIL opaque slots; (uintptr_t) makes the const-strip explicit. */
-	rail_config.p_opaque_handle_0 = (void *)(uintptr_t)dev;
-	rail_config.p_opaque_handle_1 = data;
-
-	rail_config.events_callback = silabs_efr32_rail_events_callback;
-
-	rail_config.rx_packet_queue_entries = sl_rail_builtin_rx_packet_queue_entries;
-	rail_config.p_rx_packet_queue = sl_rail_builtin_rx_packet_queue_ptr;
-
-	rail_config.rx_fifo_bytes = sl_rail_builtin_rx_fifo_bytes;
-	rail_config.p_rx_fifo_buffer = sl_rail_builtin_rx_fifo_ptr;
-
-	rail_config.tx_fifo_bytes = SL_802154_RAIL_TX_FIFO_BYTES;
-	rail_config.p_tx_fifo_buffer = data->radio_data.rail_tx_fifo;
+	sl_rail_config_t rail_config = {
+		/* Stash dev/data in RAIL opaque slots; cast strips const for void * storage. */
+		.p_opaque_handle_0 = (void *)dev,
+		.p_opaque_handle_1 = data,
+		.events_callback = silabs_efr32_rail_events_callback,
+		.rx_packet_queue_entries = sl_rail_builtin_rx_packet_queue_entries,
+		.p_rx_packet_queue = sl_rail_builtin_rx_packet_queue_ptr,
+		.rx_fifo_bytes = sl_rail_builtin_rx_fifo_bytes,
+		.p_rx_fifo_buffer = sl_rail_builtin_rx_fifo_ptr,
+		.tx_fifo_bytes = sizeof(data->radio_data.rail_tx_fifo),
+		.p_tx_fifo_buffer = data->radio_data.rail_tx_fifo,
+	};
 
 	status = sl_rail_init(&handle, &rail_config, NULL);
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
@@ -1621,7 +1671,7 @@ static int sl_802154_rail_init(const struct device *dev)
 
 static int sl_802154_rail_config(const struct device *dev)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_status_t status;
 
 	sl_rail_util_pa_init();
@@ -1677,8 +1727,8 @@ static int sl_802154_rail_config(const struct device *dev)
 		}
 	}
 
-	status =
-		sl_rail_util_pa_post_init(data->radio_data.rail_handle, SL_RAIL_TX_PA_MODE_2P4_GHZ);
+	status = sl_rail_util_pa_post_init(data->radio_data.rail_handle,
+					   SL_RAIL_TX_PA_MODE_2P4_GHZ);
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
 		LOG_ERR("sl_rail_util_pa_post_init failed: %d", (int)status);
 		return -EIO;
@@ -1743,13 +1793,16 @@ static sl_rail_status_t schedule_next_reading(sl_rail_handle_t handle,
 					      sl_rail_multi_timer_t *rail_timer)
 {
 	sl_rail_cancel_multi_timer(handle, rail_timer);
-	return sl_rail_set_multi_timer(
-		handle, rail_timer, SYMBOLS_PER_ENERGY_READING * get_symbol_duration_us(handle),
-		SL_RAIL_TIME_DELAY, silabs_efr32_rail_timer_callback, handle);
+	return sl_rail_set_multi_timer(handle,
+				       rail_timer,
+				       SYMBOLS_PER_ENERGY_READING * get_symbol_duration_us(handle),
+				       SL_RAIL_TIME_DELAY,
+				       silabs_efr32_rail_timer_callback,
+				       handle);
 }
 
 /* Teardown without callback; for sync-error paths that return an errno. */
-static void energy_scan_cleanup(sl_rail_handle_t handle, struct silabs_efr32_802154_data *data)
+static void energy_scan_cleanup(sl_rail_handle_t handle, struct sl_802154_data *data)
 {
 	sl_rail_cancel_multi_timer(handle, &data->radio_data.rail_timer);
 	data->ed_scan_data.in_progress = false;
@@ -1764,7 +1817,7 @@ static void energy_scan_finalize(sl_rail_handle_t handle)
 {
 	const sl_rail_config_t *rail_config = sl_rail_get_config(handle);
 	const struct device *dev = rail_config->p_opaque_handle_0;
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	energy_scan_done_cb_t cb = data->ed_scan_data.energy_scan_done;
 	int8_t result = data->ed_scan_data.max_reading;
 
@@ -1783,13 +1836,19 @@ static void silabs_efr32_rail_timer_callback(struct sl_rail_multi_timer *tmr,
 
 	sl_rail_handle_t handle = callback_arg;
 	const sl_rail_config_t *rail_config = sl_rail_get_config(handle);
-	struct silabs_efr32_802154_data *data = rail_config->p_opaque_handle_1;
-	struct silabs_efr32_energy_scan_data *ed_scan_data = &data->ed_scan_data;
+	struct sl_802154_data *data = rail_config->p_opaque_handle_1;
+	struct sl_802154_energy_scan_data *ed_scan_data = &data->ed_scan_data;
 
 	bool wait_for_rssi = (ed_scan_data->frame_counter == ed_scan_data->frame_counter_max - 1);
-	int16_t rssi_quartered_dbm = sl_rail_get_rssi(
-		data->radio_data.rail_handle,
-		wait_for_rssi ? SL_RAIL_GET_RSSI_WAIT_WITHOUT_TIMEOUT : SL_RAIL_GET_RSSI_NO_WAIT);
+	unsigned int rssi_get_mode;
+
+	if (wait_for_rssi) {
+		rssi_get_mode = SL_RAIL_GET_RSSI_WAIT_WITHOUT_TIMEOUT;
+	} else {
+		rssi_get_mode = SL_RAIL_GET_RSSI_NO_WAIT;
+	}
+
+	int16_t rssi_quartered_dbm = sl_rail_get_rssi(data->radio_data.rail_handle, rssi_get_mode);
 
 	if (rssi_quartered_dbm == SL_RAIL_RSSI_INVALID) {
 		ed_scan_data->max_reading = INT8_MIN;
@@ -1813,49 +1872,33 @@ static void silabs_efr32_rail_timer_callback(struct sl_rail_multi_timer *tmr,
 }
 
 /*************************************************************************************************/
-
-/* DT-derived crystal precisions used by silabs_efr32_get_acc(), with safe
- * fallbacks when the corresponding phandle is absent on the ieee802154 node.
- *   - HFXO: defaults to 250 ppm (preserves prior behavior on boards that
- *     don't wire the optional hfxo phandle).
- *   - sleep-clock: defaults to 0 ppm (only contributes when the build is a
- *     Sleepy End Device, mirroring the SISDK PAL).
- */
-#define SILABS_EFR32_HFXO_PPM                                                                      \
-	COND_CODE_1(DT_INST_NODE_HAS_PROP(0, hfxo),                                                \
-		    (DT_PROP(DT_INST_PHANDLE(0, hfxo), precision)), (250))
-
-#define SILABS_EFR32_SLEEP_CLOCK_PPM                                                               \
-	COND_CODE_1(DT_INST_NODE_HAS_PROP(0, sleep_clock),                                         \
-		    (DT_PROP(DT_INST_PHANDLE(0, sleep_clock), precision)), (0))
-
 IEEE802154_DEFINE_PHY_SUPPORTED_CHANNELS(silabs_efr32_drv_attr, OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN,
 					 OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MAX);
 
 static int silabs_efr32_attr_get(const struct device *dev, enum ieee802154_attr attr,
 				 struct ieee802154_attr_value *value)
 {
+	int ret;
+
 	ARG_UNUSED(dev);
 
-	if (ieee802154_attr_get_channel_page_and_range(
-		    attr, IEEE802154_ATTR_PHY_CHANNEL_PAGE_ZERO_OQPSK_2450_BPSK_868_915,
-		    &silabs_efr32_drv_attr.phy_supported_channels, value) == 0) {
-		return 0;
+	const enum ieee802154_phy_channel_page phy_page =
+		IEEE802154_ATTR_PHY_CHANNEL_PAGE_ZERO_OQPSK_2450_BPSK_868_915;
+
+	ret = ieee802154_attr_get_channel_page_and_range
+		(attr, phy_page, &silabs_efr32_drv_attr.phy_supported_channels, value);
+
+	if (ret) {
+		return -ENOENT;
 	}
 
-	return -ENOENT;
-}
-
-static void silabs_efr32_irq_config(const struct device *dev)
-{
-	ARG_UNUSED(dev);
-	/* RAIL IRQs are installed by rail_isr_installer() in soc_radio.c (soc_early_init_hook). */
+	return 0;
 }
 
 static void silabs_efr32_iface_init(struct net_if *iface)
 {
 	const struct device *dev = net_if_get_device(iface);
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	uint8_t eui64[8];
 
 	data->iface = iface;
@@ -1893,7 +1936,7 @@ static int silabs_efr32_cca(const struct device *dev)
 
 static int silabs_efr32_set_channel(const struct device *dev, uint16_t channel)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 
 	if (channel < OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN ||
 	    channel > OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MAX) {
@@ -1907,7 +1950,7 @@ static int silabs_efr32_set_channel(const struct device *dev, uint16_t channel)
 static int silabs_efr32_filter(const struct device *dev, bool set, enum ieee802154_filter_type type,
 			       const struct ieee802154_filter *filter)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 
 	if (!set) {
 		return -ENOTSUP;
@@ -1941,16 +1984,17 @@ static int silabs_efr32_filter(const struct device *dev, bool set, enum ieee8021
 
 static int silabs_efr32_set_txpower(const struct device *dev, int16_t dbm)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_tx_power_t tx_power;
+	sl_rail_status_t status;
 
 	if (!data->radio_data.rail_initialized) {
 		return -EAGAIN;
 	}
 	tx_power = (sl_rail_tx_power_t)dbm * 10;
 	data->radio_data.txpwr = tx_power;
-	if (sl_rail_set_tx_power_dbm(data->radio_data.rail_handle, tx_power) !=
-	    SL_RAIL_STATUS_NO_ERROR) {
+	status = sl_rail_set_tx_power_dbm(data->radio_data.rail_handle, tx_power);
+	if (status != SL_RAIL_STATUS_NO_ERROR) {
 		return -EIO;
 	}
 	return 0;
@@ -1959,7 +2003,7 @@ static int silabs_efr32_set_txpower(const struct device *dev, int16_t dbm)
 static int silabs_efr32_start(const struct device *dev)
 {
 	sl_rail_status_t status;
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_scheduler_info_t bg_rx = {
 		.priority = CONFIG_IEEE802154_SILABS_EFR32_BG_RX_PRIORITY,
 		.slip_time = 0,
@@ -1980,7 +2024,7 @@ static int silabs_efr32_start(const struct device *dev)
 
 static int silabs_efr32_stop(const struct device *dev)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 
 	if (sl_802154_state_is_tx_data_ongoing(&data->radio_data.state)) {
 		return -EBUSY;
@@ -1995,17 +2039,25 @@ static int silabs_efr32_stop(const struct device *dev)
 static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mode,
 			   struct net_pkt *pkt, struct net_buf *frag)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_status_t status;
+	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
+	uint8_t len;
+	sl_rail_scheduler_info_t tx_scheduler_info = {
+		.priority = CONFIG_IEEE802154_SILABS_EFR32_TX_PRIORITY_MIN,
+		.slip_time = SL_802154_SCHEDULER_CHANNEL_SLIP_TIME,
+		.transaction_time = 0 /* will be calculated later if DMP is used */
+	};
+	sl_rail_csma_config_t csma = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA;
+	int sec_ret;
+	__maybe_unused uint32_t sym_rate;
+	__maybe_unused uint32_t bit_rate;
 
 	if (!data->radio_data.rail_initialized) {
 		return -ENOTSUP;
 	}
 
 	__ASSERT_NO_MSG(!sl_802154_state_is_tx_data_ongoing(&data->radio_data.state));
-
-	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
-	uint8_t len;
 
 	if ((size_t)frag->len + SL_802154_CRC_BYTES > sizeof(data->tx_buffer)) {
 		return -EMSGSIZE;
@@ -2018,9 +2070,8 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	sl_802154_load_mhr(data->tx_buffer, frag->len, &data->tx_mhr);
 
 	if (!net_pkt_ieee802154_frame_secured(pkt)) {
-		int sec_ret =
-			sl_802154_security_process_tx(data, data->tx_buffer, len, &data->tx_mhr,
-						      net_pkt_ieee802154_mac_hdr_rdy(pkt));
+		sec_ret = sl_802154_security_process_tx(data, data->tx_buffer, len, &data->tx_mhr,
+							net_pkt_ieee802154_mac_hdr_rdy(pkt));
 
 		if (sec_ret < 0) {
 			sl_802154_state_set_tx_data_ongoing(&data->radio_data.state, false);
@@ -2034,21 +2085,15 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	k_sem_reset(&data->ack_wait);
 	data->tx_errno = -EIO; /* default if no event fires */
 
-	sl_rail_scheduler_info_t tx_scheduler_info = {
-		.priority = CONFIG_IEEE802154_SILABS_EFR32_TX_PRIORITY_MIN,
-		.slip_time = SL_802154_SCHEDULER_CHANNEL_SLIP_TIME,
-		.transaction_time = 0 /* will be calculated later if DMP is used */
-	};
-
 	if (data->tx_mhr.fs->fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
 		/* time we wait for ACK */
 		if (IS_ENABLED(CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL)) {
-			if (sl_rail_get_symbol_rate(data->radio_data.rail_handle) > 0) {
+			sym_rate = sl_rail_get_symbol_rate(data->radio_data.rail_handle);
+
+			if (sym_rate > 0) {
 				tx_scheduler_info.transaction_time +=
-					(sl_rail_time_t)(12 * 1e6 /
-							 sl_rail_get_symbol_rate(
-								 data->radio_data.rail_handle));
+					(sl_rail_time_t)((12 * 1e6) / sym_rate);
 			} else {
 				tx_scheduler_info.transaction_time +=
 					12 * SL_802154_TIMING_DEFAULT_SYMBOLTIME_US;
@@ -2057,11 +2102,11 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	}
 
 	if (IS_ENABLED(CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL)) {
-		if (sl_rail_get_bit_rate(data->radio_data.rail_handle) > 0) {
+		bit_rate = sl_rail_get_bit_rate(data->radio_data.rail_handle);
+
+		if (bit_rate > 0) {
 			tx_scheduler_info.transaction_time +=
-				(sl_rail_time_t)((len + 4 + 1 + 1) * 8 * 1e6 /
-						 sl_rail_get_bit_rate(
-							 data->radio_data.rail_handle));
+				(sl_rail_time_t)(((len + 4 + 1 + 1) * 8 * 1e6) / bit_rate);
 		} else { /* assume 250kbps */
 			tx_scheduler_info.transaction_time +=
 				(len + 4 + 1 + 1) * SL_802154_TIMING_DEFAULT_BYTETIME_US;
@@ -2074,8 +2119,6 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 		if (IS_ENABLED(CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL)) {
 			tx_scheduler_info.transaction_time += SL_802154_TIMING_CSMA_OVERHEAD_US;
 		}
-		sl_rail_csma_config_t csma = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA;
-
 		csma.csma_tries = data->radio_data.csma_ca_backoffs;
 		csma.cca_threshold_dbm = SL_802154_CCA_THRESHOLD_DEFAULT;
 		status = sl_rail_start_cca_csma_tx(data->radio_data.rail_handle,
@@ -2118,8 +2161,16 @@ static int silabs_efr32_energy_scan_start(const struct device *dev, uint16_t dur
 					  energy_scan_done_cb_t done_cb)
 {
 	sl_rail_status_t status;
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_handle_t handle = data->radio_data.rail_handle;
+	uint32_t sample_period_us;
+	uint32_t scan_duration_us;
+	uint32_t max_samples;
+	sl_rail_scheduler_info_t rx_scheduler_info = {
+		.priority = CONFIG_IEEE802154_SILABS_EFR32_BG_RX_PRIORITY,
+		.slip_time = 0,
+		.transaction_time = 0,
+	};
 
 	if (!data->radio_data.rail_initialized || done_cb == NULL) {
 		return -ENETDOWN;
@@ -2130,16 +2181,16 @@ static int silabs_efr32_energy_scan_start(const struct device *dev, uint16_t dur
 	}
 
 	/* ed_scan duration is per Zephyr radio API in milliseconds. */
-	uint32_t sample_period_us =
+	sample_period_us =
 		(uint32_t)SYMBOLS_PER_ENERGY_READING * get_symbol_duration_us(handle);
-	uint32_t scan_duration_us = (uint32_t)duration * USEC_PER_MSEC;
-	uint32_t max_samples = sample_period_us ? (scan_duration_us / sample_period_us) : 1;
+	scan_duration_us = (uint32_t)duration * USEC_PER_MSEC;
+	max_samples = sample_period_us ? (scan_duration_us / sample_period_us) : 1;
 
 	if (max_samples == 0) {
 		max_samples = 1;
 	}
 
-	data->ed_scan_data = (struct silabs_efr32_energy_scan_data){
+	data->ed_scan_data = (struct sl_802154_energy_scan_data){
 		.frame_counter_max = max_samples,
 		.max_reading = INT8_MIN,
 		.in_progress = false,
@@ -2152,11 +2203,6 @@ static int silabs_efr32_energy_scan_start(const struct device *dev, uint16_t dur
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
 		return -EIO;
 	}
-
-	sl_rail_scheduler_info_t rx_scheduler_info = {
-		.priority = CONFIG_IEEE802154_SILABS_EFR32_BG_RX_PRIORITY,
-		.slip_time = 0,
-		.transaction_time = 0};
 
 	status = sl_rail_start_rx(handle, data->current_channel, &rx_scheduler_info);
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
@@ -2178,7 +2224,7 @@ static int silabs_efr32_energy_scan_start(const struct device *dev, uint16_t dur
 
 static net_time_t silabs_efr32_get_time(const struct device *dev)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	uint32_t now_32_us;
 	uint64_t ns64;
 	unsigned int key;
@@ -2186,19 +2232,19 @@ static net_time_t silabs_efr32_get_time(const struct device *dev)
 	if (!data->radio_data.rail_initialized) {
 		return -1;
 	}
-	/* Hold irq_lock across the timer read and us32_to_ns64() so an ISR
+	/* Hold irq_lock across the timer read and sl_802154_us32_to_ns64() so an ISR
 	 * cannot observe a later value first and cause a spurious wrap.
 	 */
 	key = irq_lock();
 	now_32_us = sl_rail_get_time(data->radio_data.rail_handle);
-	ns64 = us32_to_ns64(now_32_us);
+	ns64 = sl_802154_us32_to_ns64(now_32_us);
 	irq_unlock(key);
 	return (net_time_t)ns64;
 }
 
 static uint8_t silabs_efr32_get_acc(const struct device *dev)
 {
-	const struct silabs_efr32_802154_config *cfg = dev->config;
+	const struct sl_802154_config *cfg = dev->config;
 	uint32_t ppm = cfg->hfxo_accuracy_ppm;
 
 	/* The radio's awake-time timing reference is HFXO, so its
@@ -2210,10 +2256,7 @@ static uint8_t silabs_efr32_get_acc(const struct device *dev)
 	 * between polls, so the sleep-clock drift never applies even on
 	 * an MTD_SED build.
 	 */
-	const bool is_sed = IS_ENABLED(CONFIG_OPENTHREAD_MTD_SED);
-	const bool pm_enabled = IS_ENABLED(CONFIG_PM);
-
-	if (is_sed && pm_enabled) {
+	if (IS_ENABLED(CONFIG_OPENTHREAD_MTD_SED) && IS_ENABLED(CONFIG_PM)) {
 		ppm += cfg->sleep_clock_accuracy_ppm;
 	}
 
@@ -2221,7 +2264,7 @@ static uint8_t silabs_efr32_get_acc(const struct device *dev)
 }
 
 static int sl_802154_configure_ack_fpb(const struct device *dev,
-				       struct silabs_efr32_802154_data *data,
+				       struct sl_802154_data *data,
 				       const struct ieee802154_config *config)
 {
 	/* Soft source match table (SiSDK soft_source_table_match / AddSrcMatch*). */
@@ -2230,32 +2273,37 @@ static int sl_802154_configure_ack_fpb(const struct device *dev,
 			return -EINVAL;
 		}
 		if (config->ack_fpb.extended) {
-			return src_match_ext_add(&data->match_data, config->ack_fpb.addr);
+			return sl_802154_src_match_ext_add(&data->match_data,
+							   config->ack_fpb.addr);
 		} else {
-			return src_match_short_add(&data->match_data, config->ack_fpb.addr);
+			return sl_802154_src_match_short_add(&data->match_data,
+							     config->ack_fpb.addr);
 		}
 	}
 	if (config->ack_fpb.addr != NULL) {
 		if (config->ack_fpb.extended) {
-			return src_match_ext_remove(&data->match_data, config->ack_fpb.addr);
+			return sl_802154_src_match_ext_remove(&data->match_data,
+							    config->ack_fpb.addr);
 		} else {
-			return src_match_short_remove(&data->match_data, config->ack_fpb.addr);
+			return sl_802154_src_match_short_remove(&data->match_data,
+							       config->ack_fpb.addr);
 		}
 	}
 	if (config->ack_fpb.extended) {
-		src_match_ext_clear(&data->match_data);
+		sl_802154_src_match_ext_clear(&data->match_data);
 	} else {
-		src_match_short_clear(&data->match_data);
+		sl_802154_src_match_short_clear(&data->match_data);
 	}
 	return 0;
 }
 
 static int sl_802154_configure_mac_keys(const struct device *dev,
-					struct silabs_efr32_802154_data *data,
+					struct sl_802154_data *data,
 					const struct ieee802154_config *config)
 {
 	struct ieee802154_key *in = config->mac_keys;
 	uint8_t sec_key_count = 0;
+	struct sl_802154_mac_data *mac_data = &data->mac_data;
 
 	if (in == NULL) {
 		return -EINVAL;
@@ -2263,12 +2311,6 @@ static int sl_802154_configure_mac_keys(const struct device *dev,
 
 	/* Reset FC before key install to avoid new-key + stale-FC enh-ACK race. */
 	data->mac_data.frame_counter = 0;
-
-	if (in->key_value == NULL) {
-		/* Clear all keys (e.g. OpenThread stack reset). */
-		return 0;
-	}
-	struct silabs_efr32_mac_data *mac_data = &data->mac_data;
 
 	for (; in->key_value != NULL && sec_key_count < ARRAY_SIZE(mac_data->sec_keys); in++) {
 		uint8_t kid;
@@ -2299,13 +2341,17 @@ static int sl_802154_configure_mac_keys(const struct device *dev,
 }
 
 static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
-						 struct silabs_efr32_802154_data *data,
+						 struct sl_802154_data *data,
 						 const struct ieee802154_config *config)
 {
+	uint8_t element_id;
+
+	ARG_UNUSED(dev);
 
 	if (config->ack_ie.purge_ie) {
 		if (IS_ENABLED(CONFIG_OPENTHREAD_LINK_METRICS_SUBJECT)) {
-			data->ack_ie.link_metrics_header_ie = (struct ieee802154_header_ie){0};
+			memset(&data->ack_ie.link_metrics_header_ie, 0,
+			       sizeof(data->ack_ie.link_metrics_header_ie));
 		}
 		return 0;
 	}
@@ -2318,7 +2364,7 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 	data->ack_ie.short_addr = sys_get_le16((const uint8_t *)&config->ack_ie.short_addr);
 	sys_memcpy_swap(data->ack_ie.ext_addr, config->ack_ie.ext_addr, IEEE802154_EXT_ADDR_LENGTH);
 
-	uint8_t element_id = ieee802154_header_ie_get_element_id(config->ack_ie.header_ie);
+	element_id = ieee802154_header_ie_get_element_id(config->ack_ie.header_ie);
 
 	if (element_id != IEEE802154_HEADER_IE_ELEMENT_ID_VENDOR_SPECIFIC_IE) {
 		return -ENOTSUP;
@@ -2336,7 +2382,7 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 static int silabs_efr32_configure(const struct device *dev, enum ieee802154_config_type type,
 				  const struct ieee802154_config *config)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
 	sl_rail_status_t status;
 
 	if (config == NULL) {
@@ -2346,7 +2392,7 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 	switch (type) {
 	case IEEE802154_CONFIG_PROMISCUOUS:
 		if (!data->radio_data.rail_initialized) {
-			return -EAGAIN;
+			return -EINVAL;
 		}
 		data->promiscuous = config->promiscuous;
 		status = sl_rail_ieee802154_set_promiscuous_mode(data->radio_data.rail_handle,
@@ -2355,7 +2401,7 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 
 	case IEEE802154_CONFIG_PAN_COORDINATOR:
 		if (!data->radio_data.rail_initialized) {
-			return -EAGAIN;
+			return -EINVAL;
 		}
 		data->pan_coordinator = config->pan_coordinator;
 		status = sl_rail_ieee802154_set_pan_coordinator(data->radio_data.rail_handle,
@@ -2373,9 +2419,8 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 		data->event_handler = config->event_handler;
 		return 0;
 
-	case IEEE802154_CONFIG_MAC_KEYS: {
+	case IEEE802154_CONFIG_MAC_KEYS:
 		return sl_802154_configure_mac_keys(dev, data, config);
-	}
 
 	case IEEE802154_CONFIG_FRAME_COUNTER:
 		if (config->frame_counter <= data->mac_data.frame_counter) {
@@ -2406,11 +2451,12 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 static int silabs_efr32_continuous_carrier(const struct device *dev)
 {
 	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
-	struct silabs_efr32_802154_data *data = dev->data;
+	struct sl_802154_data *data = dev->data;
+	sl_rail_status_t ret;
 
-	if (sl_rail_start_tx_stream(data->radio_data.rail_handle, data->current_channel,
-				    SL_RAIL_STREAM_CARRIER_WAVE,
-				    tx_options) != SL_RAIL_STATUS_NO_ERROR) {
+	ret = sl_rail_start_tx_stream(data->radio_data.rail_handle, data->current_channel,
+				      SL_RAIL_STREAM_CARRIER_WAVE, tx_options);
+	if (ret != SL_RAIL_STATUS_NO_ERROR) {
 		return -EIO;
 	}
 	return 0;
@@ -2424,10 +2470,13 @@ static int silabs_efr32_modulated_carrier(const struct device *dev, const uint8_
 }
 #endif
 
-static const struct silabs_efr32_802154_config silabs_efr32_radio_cfg = {
-	.irq_config_func = silabs_efr32_irq_config,
-	.hfxo_accuracy_ppm = SILABS_EFR32_HFXO_PPM,
-	.sleep_clock_accuracy_ppm = SILABS_EFR32_SLEEP_CLOCK_PPM,
+static const struct sl_802154_config silabs_efr32_radio_cfg = {
+	.hfxo_accuracy_ppm = COND_CODE_1(DT_INST_NODE_HAS_PROP(0, hfxo),
+					 (DT_PROP(DT_INST_PHANDLE(0, hfxo), precision)), (250)),
+	.sleep_clock_accuracy_ppm = COND_CODE_1(DT_INST_NODE_HAS_PROP(0, sleep_clock),
+						 (DT_PROP(DT_INST_PHANDLE(0, sleep_clock),
+							  precision)),
+						 (0)),
 };
 
 static const struct ieee802154_radio_api silabs_efr32_radio_api = {
@@ -2454,8 +2503,8 @@ static const struct ieee802154_radio_api silabs_efr32_radio_api = {
 /* Returns 0 on success, negative errno on failure. */
 static int silabs_efr32_init(const struct device *dev)
 {
-	struct silabs_efr32_802154_data *data = dev->data;
-	const struct silabs_efr32_802154_config *cfg = dev->config;
+	struct sl_802154_data *data = dev->data;
+	const struct sl_802154_config *cfg = dev->config;
 	int r;
 
 	if (data->radio_data.rail_initialized) {
@@ -2487,38 +2536,38 @@ static int silabs_efr32_init(const struct device *dev)
 }
 
 /* Driver data */
-static struct silabs_efr32_802154_data silabs_efr32_data = {
+static struct sl_802154_data silabs_efr32_data = {
 	.radio_data = {
 		.state = ATOMIC_INIT(0),
 		.rail_ieee802154_config = {
-				.p_addresses = NULL,
-				.ack_config = {
-						.enable = true,
-						.ack_timeout_us = 672,
-						.rx_transitions = {
-								.success = SL_RAIL_RF_STATE_RX,
-								.error = SL_RAIL_RF_STATE_RX
-						},
-						.tx_transitions = {
-								.success = SL_RAIL_RF_STATE_RX,
-								.error = SL_RAIL_RF_STATE_RX
-						},
-					},
-				.timings = {
-						.idle_to_rx = 100,
-						.tx_to_rx = 192 - 10,
-						.idle_to_tx = 100,
-						.rx_to_tx = 192,
-						.rxsearch_timeout = 0,
-						.tx_to_rxsearch_timeout = 0,
-						.tx_to_tx = 0,
-					},
-				.frames_mask = SL_RAIL_IEEE802154_ACCEPT_STANDARD_FRAMES,
-				.promiscuous_mode = false,
-				.is_pan_coordinator = false,
-				.default_frame_pending_in_outgoing_acks = false,
-			}}
-	/* ... */
+			.p_addresses = NULL,
+			.ack_config = {
+				.enable = true,
+				.ack_timeout_us = 672,
+				.rx_transitions = {
+					.success = SL_RAIL_RF_STATE_RX,
+					.error = SL_RAIL_RF_STATE_RX,
+				},
+				.tx_transitions = {
+					.success = SL_RAIL_RF_STATE_RX,
+					.error = SL_RAIL_RF_STATE_RX,
+				},
+			},
+			.timings = {
+				.idle_to_rx = 100,
+				.tx_to_rx = 192 - 10,
+				.idle_to_tx = 100,
+				.rx_to_tx = 192,
+				.rxsearch_timeout = 0,
+				.tx_to_rxsearch_timeout = 0,
+				.tx_to_tx = 0,
+			},
+			.frames_mask = SL_RAIL_IEEE802154_ACCEPT_STANDARD_FRAMES,
+			.promiscuous_mode = false,
+			.is_pan_coordinator = false,
+			.default_frame_pending_in_outgoing_acks = false,
+		},
+	},
 };
 
 #if defined(CONFIG_NET_L2_IEEE802154)

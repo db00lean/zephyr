@@ -202,9 +202,9 @@ struct sl_802154_data {
 	 */
 	int tx_errno;
 
-	/* CSL sample time and period. */
-	uint32_t csl_sample_time;
-	uint32_t csl_period_us;
+	/* CSL anchor time at start-of-MHR in microseconds and period in 10-symbol units. */
+	uint32_t csl_sample_time_us;
+	uint32_t csl_period;
 
 	/* Current channel (11-26 for 2.4 GHz O-QPSK). Set by set_channel(). */
 	uint16_t current_channel;

@@ -470,10 +470,17 @@ static int sl_802154_security_process_tx(struct sl_802154_data *data, uint8_t *b
 #define SL_802154_CCA_THRESHOLD_DEFAULT        -75
 #define SL_802154_SHR_DURATION_US              160
 #define SL_802154_SCHEDULE_TX_DELAY_US         3000
+#define SL_802154_RX_TO_ENH_ACK_TX_US          256
+#define SL_802154_PHR_DURATION_US              (SL_802154_PHR_BYTES * OT_RADIO_SYMBOL_TIME * 2)
 
+#define SL_802154_CSMA_BACKOFF_TIME_US 150
 #define SL_802154_FLAG_ONGOING_TX_DATA 0
 #define SL_802154_FLAG_ONGOING_TX_ACK  1
 #define SL_802154_FLAG_WAITING_FOR_ACK 2
+#define SL_802154_FLAG_RX_STARTED 3
+#define SL_802154_FLAG_RX_SLOT_OFF 4
+#define SL_802154_FLAG_SCHEDULED_RX_PENDING 5
+#define SL_802154_FLAG_SCHEDULED_RX_STARTED 6
 
 static void sl_802154_state_set_tx_ack_ongoing(atomic_t *state, bool ongoing)
 {
@@ -509,6 +516,46 @@ static void sl_802154_state_clear_tx_data_and_wait_for_ack(atomic_t *state)
 {
 	atomic_and(state, ~(BIT(SL_802154_FLAG_ONGOING_TX_DATA) |
 				  BIT(SL_802154_FLAG_WAITING_FOR_ACK)));
+}
+
+static void sl_802154_state_set_rx_started(atomic_t *state, bool started)
+{
+	atomic_set_bit_to(state, SL_802154_FLAG_RX_STARTED, started);
+}
+
+static bool sl_802154_state_is_rx_started(atomic_t *state)
+{
+	return atomic_test_bit(state, SL_802154_FLAG_RX_STARTED);
+}
+
+static void sl_802154_state_set_rx_slot_off(atomic_t *state, bool off)
+{
+	atomic_set_bit_to(state, SL_802154_FLAG_RX_SLOT_OFF, off);
+}
+
+static bool sl_802154_state_is_rx_slot_off(atomic_t *state)
+{
+	return atomic_test_bit(state, SL_802154_FLAG_RX_SLOT_OFF);
+}
+
+static void sl_802154_state_set_scheduled_rx_pending(atomic_t *state, bool pending)
+{
+	atomic_set_bit_to(state, SL_802154_FLAG_SCHEDULED_RX_PENDING, pending);
+}
+
+static bool sl_802154_state_is_rx_scheduled(atomic_t *state)
+{
+	return atomic_test_bit(state, SL_802154_FLAG_SCHEDULED_RX_PENDING);
+}
+
+static void sl_802154_state_set_scheduled_rx_started(atomic_t *state, bool started)
+{
+	atomic_set_bit_to(state, SL_802154_FLAG_SCHEDULED_RX_STARTED, started);
+}
+
+static bool sl_802154_state_is_scheduled_rx_started(atomic_t *state)
+{
+	return atomic_test_bit(state, SL_802154_FLAG_SCHEDULED_RX_STARTED);
 }
 
 /*************************************************************************************************/
@@ -752,30 +799,76 @@ static bool sl_802154_src_match_contains(struct sl_802154_data *data)
 /*************************************************************************************************/
 /* Packet Processing */
 
-#if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
-static inline uint16_t sl_802154_get_csl_phase(struct sl_802154_data *data, uint32_t rx_timestamp, uint16_t rx_packet_bytes,
-				     uint16_t rx_frame_length)
-{
-	uint32_t shr_done_time = rx_timestamp -
-				 (rx_packet_bytes * OT_RADIO_SYMBOL_TIME * 2)
-				 /* PHR of this packet */
-				 + (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
-				 /* Received frame's expected time in the PHR */
-				 + (rx_frame_length * OT_RADIO_SYMBOL_TIME * 2)
-				 /* rxToTx turnaround time */
-				 + s_rail_ieee802154_config.timings.rx_to_tx
-				 /* PHR time of the ACK */
-				 + (PHY_HEADER_SIZE * OT_RADIO_SYMBOL_TIME * 2)
-				 /* SHR time of the ACK */
-				 + (SHR_SIZE * OT_RADIO_SYMBOL_TIME * 2);
+#define SL_802154_HAS_CSL_SUPPORT                                                          \
+	(IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT) || IS_ENABLED(CONFIG_OPENTHREAD_CSL_RECEIVER))
 
-	uint32_t csl_period_us = data->csl_period_us * OT_US_PER_TEN_SYMBOLS;
-	uint32_t diff = ((data->csl_sample_time % csl_period_us) -
-			 (shr_done_time % csl_period_us) + csl_period_us) %
+static inline uint16_t sl_802154_get_csl_phase(struct sl_802154_data *data, uint32_t tx_mhr_time_us)
+{
+	uint32_t csl_period_us = data->csl_period * OT_US_PER_TEN_SYMBOLS;
+	uint32_t diff = ((data->csl_sample_time_us % csl_period_us) -
+			 (tx_mhr_time_us % csl_period_us) + csl_period_us) %
 			csl_period_us;
 	return (uint16_t)(diff / OT_US_PER_TEN_SYMBOLS);
 }
-#endif
+
+static inline uint32_t sl_802154_get_ack_mhr_time(struct sl_802154_data *data, uint32_t rx_timestamp,
+						   uint16_t rx_packet_bytes,
+						   uint16_t rx_frame_length)
+{
+	return rx_timestamp -
+	       (rx_packet_bytes * OT_RADIO_SYMBOL_TIME * 2)
+	       /* PHR of this packet */
+	       + (SL_802154_PHR_BYTES * OT_RADIO_SYMBOL_TIME * 2)
+	       /* Received frame's expected time in the PHR */
+	       + (rx_frame_length * OT_RADIO_SYMBOL_TIME * 2)
+	       /* rxToTx turnaround time */
+	       + data->radio_data.rail_ieee802154_config.timings.rx_to_tx
+	       /* PHR time of the ACK */
+	       + (SL_802154_PHR_BYTES * OT_RADIO_SYMBOL_TIME * 2)
+	       /* SHR time of the ACK */
+	       + (SL_802154_SHR_BYTES * OT_RADIO_SYMBOL_TIME * 2);
+}
+
+static bool sl_802154_update_tx_csl_ie(struct sl_802154_data *data, uint8_t frame_len,
+				       uint32_t tx_mhr_time_us)
+{
+	size_t offset;
+
+	if (!data->tx_mhr.fs->fc.ie_list) {
+		return false;
+	}
+
+	offset = sl_802154_get_mhr_length(&data->tx_mhr);
+
+	while (offset + IEEE802154_HEADER_IE_HEADER_LENGTH <= frame_len) {
+		struct ieee802154_header_ie *ie =
+			(struct ieee802154_header_ie *)(data->tx_buffer + offset);
+		size_t ie_len = IEEE802154_HEADER_IE_HEADER_LENGTH + ie->length;
+		uint8_t element_id = ieee802154_header_ie_get_element_id(ie);
+
+		if (element_id == IEEE802154_HEADER_IE_ELEMENT_ID_HEADER_TERMINATION_1 ||
+		    element_id == IEEE802154_HEADER_IE_ELEMENT_ID_HEADER_TERMINATION_2) {
+			break;
+		}
+
+		if (offset + ie_len > frame_len) {
+			return false;
+		}
+
+		if (element_id == IEEE802154_HEADER_IE_ELEMENT_ID_CSL_IE &&
+		    ie->length >= sizeof(struct ieee802154_header_ie_csl_reduced)) {
+			ie->content.csl.reduced.csl_phase =
+				sys_cpu_to_le16(sl_802154_get_csl_phase(data, tx_mhr_time_us));
+			ie->content.csl.reduced.csl_period =
+				sys_cpu_to_le16((uint16_t)data->csl_period);
+			return true;
+		}
+
+		offset += ie_len;
+	}
+
+	return false;
+}
 
 /* Peek the in-progress RX frame into data->rx_buffer and parse MHR.
  *
@@ -1098,8 +1191,8 @@ static int sl_802154_write_enhanced_ack(struct sl_802154_data *data,
 		ie_present = match && (data->ack_ie.link_metrics_header_ie.length > 0);
 	}
 
-	if (IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT)) {
-		ie_present = match && (data->ack_ie.csl_header_ie.length > 0);
+	if (SL_802154_HAS_CSL_SUPPORT) {
+		ie_present |= (match && (data->ack_ie.csl_header_ie.length > 0));
 	}
 
 	enh_ack_mhr_length = sl_802154_construct_enh_ack_mhr(data, ie_present);
@@ -1115,15 +1208,17 @@ static int sl_802154_write_enhanced_ack(struct sl_802154_data *data,
 		enh_ack_len += (uint8_t)ie_total;
 	}
 
-	if (IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT) && ie_present) {
+	if (SL_802154_HAS_CSL_SUPPORT && match &&
+	    (data->ack_ie.csl_header_ie.length > 0)) {
 		/* This should be set to the expected length of the packet is being received.
 		* We consider this while calculating the phase value below.
 		*/
 		uint16_t recv_len = pkt_info_for_enh_ack->p_first_portion_data[0];
-		data->ack_ie.csl_header_ie.content.csl.reduced.csl_phase = sl_802154_get_csl_phase(
-			data, rx_timestamp, pkt_info_for_enh_ack->packet_bytes, recv_len);
+		data->ack_ie.csl_header_ie.content.csl.reduced.csl_phase =
+			sl_802154_get_csl_phase(data, sl_802154_get_ack_mhr_time(
+				data, rx_timestamp, pkt_info_for_enh_ack->packet_bytes, recv_len));
 		data->ack_ie.csl_header_ie.content.csl.reduced.csl_period =
-			(uint16_t)data->csl_period_us;
+			(uint16_t)data->csl_period;
 
 		/* append CSL IE header to payload */
 		size_t ie_total = IEEE802154_HEADER_IE_HEADER_LENGTH +
@@ -1610,15 +1705,21 @@ static void sl_802154_rail_events_callback(sl_rail_handle_t handle, sl_rail_even
 	/* Process scheduled events for Thread 1.2+ */
 	if (!IS_ENABLED(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)) {
 		if (events & SL_RAIL_EVENT_RX_SCHEDULED_RX_STARTED) {
-			/* do nothing */
+			sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, true);
+			LOG_DBG("Scheduled RX started");
 		}
 
 		if (events & SL_RAIL_EVENT_RX_SCHEDULED_RX_END ||
 		    events & SL_RAIL_EVENT_RX_SCHEDULED_RX_MISSED) {
+			sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+			sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
+			LOG_DBG("Scheduled RX %s", (events & SL_RAIL_EVENT_RX_SCHEDULED_RX_END) ?
+				"ended" : "missed");
 			if (data->event_handler != NULL) {
 				data->event_handler(dev, IEEE802154_EVENT_RX_OFF, NULL);
+			} else {
+				sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
 			}
-			sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
 		}
 	}
 
@@ -1670,6 +1771,9 @@ static void sl_802154_rail_events_callback(sl_rail_handle_t handle, sl_rail_even
 /*************************************************************************************************/
 
 static int silabs_efr32_set_txpower(const struct device *dev, int16_t dbm);
+static net_time_t silabs_efr32_get_time(const struct device *dev);
+static int sl_802154_start_background_rx(struct sl_802154_data *data);
+static void sl_802154_cancel_scheduled_rx(struct sl_802154_data *data);
 
 static int sl_802154_rail_init(const struct device *dev)
 {
@@ -1783,7 +1887,7 @@ static int sl_802154_rail_config(const struct device *dev)
 	}
 
 	if (!IS_ENABLED(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)) {
-		sl_rail_transition_time_t rx_to_enh_ack_tx = 256;
+		sl_rail_transition_time_t rx_to_enh_ack_tx = SL_802154_RX_TO_ENH_ACK_TX_US;
 
 		/* 802.15.4E support (only on platforms that support it, so error checking
 		 * is disabled) Note: This has to be called after
@@ -1998,13 +2102,9 @@ static void silabs_efr32_iface_init(struct net_if *iface)
 static enum ieee802154_hw_caps silabs_efr32_get_capabilities(const struct device *dev)
 {
 	ARG_UNUSED(dev);
-	/* HW_TXTIME and HW_RXTIME (CSL / TX_MODE_TXTIME / RX_SLOT) are intentionally
-	 * not advertised: TX path supports only DIRECT and CSMA_CA, and there is no
-	 * rx slot handling. Add them when CSL support lands.
-	 */
 	return IEEE802154_HW_FCS | IEEE802154_HW_FILTER | IEEE802154_HW_TX_RX_ACK |
 	       IEEE802154_HW_ENERGY_SCAN | IEEE802154_HW_SLEEP_TO_TX | IEEE802154_HW_CSMA |
-	       IEEE802154_HW_TX_SEC;
+	       IEEE802154_HW_TX_SEC | IEEE802154_HW_TXTIME | IEEE802154_HW_RXTIME;
 }
 
 static int silabs_efr32_cca(const struct device *dev)
@@ -2080,26 +2180,57 @@ static int silabs_efr32_set_txpower(const struct device *dev, int16_t dbm)
 	return 0;
 }
 
-static int silabs_efr32_start(const struct device *dev)
+static int sl_802154_start_background_rx(struct sl_802154_data *data)
 {
 	sl_rail_status_t status;
-	struct sl_802154_data *data = dev->data;
 	sl_rail_scheduler_info_t bg_rx = {
 		.priority = CONFIG_IEEE802154_SILABS_EFR32_BG_RX_PRIORITY,
 		.slip_time = 0,
 		.transaction_time = 0,
 	};
 
-	if (!data->radio_data.rail_initialized) {
-		return -EAGAIN;
-	}
 	status = sl_rail_start_rx(data->radio_data.rail_handle, (uint8_t)data->current_channel,
 				  &bg_rx);
 	if (status != SL_RAIL_STATUS_NO_ERROR) {
 		LOG_ERR("sl_rail_start_rx failed: %d", (int)status);
 		return -EIO;
 	}
+
+	sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+	sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
+
 	return 0;
+}
+
+static void sl_802154_cancel_scheduled_rx(struct sl_802154_data *data)
+{
+	if (!sl_802154_state_is_rx_scheduled(&data->radio_data.state) &&
+	    !sl_802154_state_is_scheduled_rx_started(&data->radio_data.state)) {
+		return;
+	}
+
+	LOG_DBG("Cancel scheduled RX before TX");
+	sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
+	sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+	sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
+}
+
+static int silabs_efr32_start(const struct device *dev)
+{
+	struct sl_802154_data *data = dev->data;
+
+	if (!data->radio_data.rail_initialized) {
+		return -EAGAIN;
+	}
+
+	sl_802154_state_set_rx_started(&data->radio_data.state, true);
+
+	if (sl_802154_state_is_rx_slot_off(&data->radio_data.state)) {
+		LOG_DBG("RX start deferred while RX slot keeps radio off");
+		return 0;
+	}
+
+	return sl_802154_start_background_rx(data);
 }
 
 static int silabs_efr32_stop(const struct device *dev)
@@ -2113,6 +2244,10 @@ static int silabs_efr32_stop(const struct device *dev)
 	if (data->radio_data.rail_initialized) {
 		sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
 	}
+
+	sl_802154_state_set_rx_started(&data->radio_data.state, false);
+	sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+	sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
 	return 0;
 }
 
@@ -2122,16 +2257,19 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	struct sl_802154_data *data = dev->data;
 	sl_rail_status_t status;
 	sl_rail_tx_options_t tx_options = SL_RAIL_TX_OPTIONS_DEFAULT;
+	enum ieee802154_tx_mode effective_mode = mode;
 	uint8_t len;
 	sl_rail_scheduler_info_t tx_scheduler_info = {
 		.priority = CONFIG_IEEE802154_SILABS_EFR32_TX_PRIORITY_MIN,
 		.slip_time = SL_802154_SCHEDULER_CHANNEL_SLIP_TIME,
 		.transaction_time = 0 /* will be calculated later if DMP is used */
 	};
+	sl_rail_scheduled_tx_config_t scheduled_tx_config;
 	sl_rail_csma_config_t csma = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA;
 	int sec_ret;
 	uint32_t sym_rate;
 	uint32_t bit_rate;
+	net_time_t tx_time_ns = net_pkt_timestamp_ns(pkt);
 
 	if (!data->radio_data.rail_initialized) {
 		return -ENOTSUP;
@@ -2144,25 +2282,43 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	}
 	len = (uint8_t)(frag->len + IEEE802154_FCS_LENGTH); /* PSDU = MPDU + FCS */
 
-#if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
-	struct net_ptp_time *tx_time = net_pkt_timestamp(pkt);
-
-	if (data->csl_period_us > 0 && (tx_time->second == 0 && tx_time->nanosecond == 0)) {
+	if (SL_802154_HAS_CSL_SUPPORT && data->csl_period > 0 && tx_time_ns == 0) {
 		/* Only called for CSL children (CSL period > 0)
 		 * Note: Our SSEDs "schedule" transmissions to their parent in order to know
 		 * exactly when in the future the data packets go out so they can calculate
 		 * the accurate CSL phase to send to their parent.
 		 */
-		net_pkt_set_timestamp_ns(pkt, silabs_efr32_get_time(dev) +
-						      (SL_802154_SCHEDULE_TX_DELAY_US + SL_802154_SHR_DURATION_US) *
-							      NSEC_PER_USEC);
-	}
-#endif
+		tx_time_ns = silabs_efr32_get_time(dev) +
+			     (SL_802154_SCHEDULE_TX_DELAY_US + SL_802154_SHR_DURATION_US) *
+				     NSEC_PER_USEC;
+		if (IS_ENABLED(CONFIG_NET_PKT_TXTIME)) {
+			net_pkt_set_timestamp_ns(pkt, tx_time_ns);
+		}
 
+		if (effective_mode != IEEE802154_TX_MODE_TXTIME &&
+		    effective_mode != IEEE802154_TX_MODE_TXTIME_CCA) {
+			effective_mode = IEEE802154_TX_MODE_TXTIME_CCA;
+		}
+	}
+
+	if (SL_802154_HAS_CSL_SUPPORT &&
+	    (data->csl_period > 0 || mode != effective_mode ||
+	     mode == IEEE802154_TX_MODE_TXTIME || mode == IEEE802154_TX_MODE_TXTIME_CCA)) {
+		LOG_DBG("TX mode=%d effective=%d tx_time_ns=%lld csl_period=%u", mode,
+			effective_mode, (long long)tx_time_ns, (unsigned int)data->csl_period);
+	}
+
+	sl_802154_cancel_scheduled_rx(data);
 	sl_802154_state_set_tx_data_ongoing(&data->radio_data.state, true);
 
 	memcpy(data->tx_buffer, frag->data, frag->len); /* RAIL appends FCS. */
 	sl_802154_load_mhr(data->tx_buffer, frag->len, &data->tx_mhr);
+
+	if (SL_802154_HAS_CSL_SUPPORT && data->csl_period > 0 &&
+	    !net_pkt_ieee802154_mac_hdr_rdy(pkt) && tx_time_ns != 0) {
+		(void)sl_802154_update_tx_csl_ie(data, frag->len,
+						 (uint32_t)(tx_time_ns / NSEC_PER_USEC));
+	}
 
 	if (!net_pkt_ieee802154_frame_secured(pkt)) {
 		sec_ret = sl_802154_security_process_tx(data, data->tx_buffer, len, &data->tx_mhr,
@@ -2182,6 +2338,12 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	k_sem_reset(&data->tx_wait);
 	k_sem_reset(&data->ack_wait);
 	data->tx_errno = -EIO; /* default if no event fires */
+
+	scheduled_tx_config = (sl_rail_scheduled_tx_config_t){
+		.when = (sl_rail_time_t)((tx_time_ns / NSEC_PER_USEC) - SL_802154_SHR_DURATION_US),
+		.mode = SL_RAIL_TIME_ABSOLUTE,
+		.tx_during_rx = SL_RAIL_SCHEDULED_TX_DURING_RX_POSTPONE_TX,
+	};
 
 	if (data->tx_mhr.fs->fc.ar) {
 		tx_options |= SL_RAIL_TX_OPTION_WAIT_FOR_ACK;
@@ -2212,7 +2374,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 		}
 	}
 
-	switch (mode) {
+	switch (effective_mode) {
 	case IEEE802154_TX_MODE_CSMA_CA:
 		/* time needed for CSMA/CA */
 		if (IS_ENABLED(CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL)) {
@@ -2229,8 +2391,26 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 					  (uint8_t)data->current_channel, tx_options,
 					  &tx_scheduler_info);
 		break;
+	case IEEE802154_TX_MODE_TXTIME:
+		status = sl_rail_start_scheduled_tx(data->radio_data.rail_handle,
+			data->current_channel,
+			tx_options,
+			&scheduled_tx_config,
+			&tx_scheduler_info);
+		break;
+	case IEEE802154_TX_MODE_TXTIME_CCA:
+		csma = (sl_rail_csma_config_t)SL_RAIL_CSMA_CONFIG_SINGLE_CCA;
+		csma.cca_backoff_us = SL_802154_CSMA_BACKOFF_TIME_US;
+		scheduled_tx_config.when -= csma.cca_backoff_us;
+		status = sl_rail_start_scheduled_cca_csma_tx(data->radio_data.rail_handle,
+			data->current_channel,
+			tx_options,
+			&scheduled_tx_config,
+			&csma,
+			&tx_scheduler_info);
+		break;
 	default:
-		LOG_ERR("TX mode %d not supported", mode);
+		LOG_ERR("TX mode %d not supported", effective_mode);
 		sl_802154_handle_tx_failed(data);
 		return -ENOTSUP;
 	}
@@ -2453,7 +2633,7 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 			memset(&data->ack_ie.link_metrics_header_ie, 0,
 			       sizeof(data->ack_ie.link_metrics_header_ie));
 		}
-		if (IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT)) {
+		if (SL_802154_HAS_CSL_SUPPORT) {
 			memset(&data->ack_ie.csl_header_ie, 0,
 			       sizeof(data->ack_ie.csl_header_ie));
 		}
@@ -2473,6 +2653,10 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 			memset(&data->ack_ie.link_metrics_header_ie, 0,
 			       sizeof(data->ack_ie.link_metrics_header_ie));
 		}
+		if (SL_802154_HAS_CSL_SUPPORT) {
+			memset(&data->ack_ie.csl_header_ie, 0,
+			       sizeof(data->ack_ie.csl_header_ie));
+		}
 		return 0;
 	}
 
@@ -2486,7 +2670,7 @@ static int sl_802154_configure_enh_ack_header_ie(const struct device *dev,
 		}
 		memcpy(&data->ack_ie.link_metrics_header_ie, config->ack_ie.header_ie, ie_total);
 	} else if (element_id == IEEE802154_HEADER_IE_ELEMENT_ID_CSL_IE &&
-	    IS_ENABLED(CONFIG_IEEE802154_CSL_ENDPOINT)) {
+		   SL_802154_HAS_CSL_SUPPORT) {
 		ie_total = IEEE802154_HEADER_IE_HEADER_LENGTH + config->ack_ie.header_ie->length;
 		if (ie_total > sizeof(data->ack_ie.csl_header_ie)) {
 			return -EMSGSIZE;
@@ -2561,35 +2745,86 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 		data->radio_data.csma_ca_backoffs = config->csma_ca_backoffs;
 		return 0;
 
-#if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
 	case IEEE802154_CONFIG_RX_SLOT:
+		if (!SL_802154_HAS_CSL_SUPPORT) {
+			return -ENOTSUP;
+		}
+
+		LOG_DBG("RX_SLOT start=%lld duration=%lld channel=%u", (long long)config->rx_slot.start,
+			(long long)config->rx_slot.duration, (unsigned int)config->rx_slot.channel);
+
 		sl_rail_scheduler_info_t scheduler_info = {
-			.priority = SL_802154_RADIO_PRIO_BACKGROUND_RX_VALUE,
+			.priority = CONFIG_IEEE802154_SILABS_EFR32_BG_RX_PRIORITY,
 			.slip_time = 0,
 			.transaction_time = 0,
 		};
+
+		if (config->rx_slot.start == IEEE802154_CONFIG_RX_SLOT_NONE) {
+			sl_802154_state_set_rx_slot_off(&data->radio_data.state, false);
+			sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+			sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
+
+			if (sl_802154_state_is_rx_started(&data->radio_data.state)) {
+				sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
+				return sl_802154_start_background_rx(data);
+			}
+
+			return 0;
+		}
+
+		if (config->rx_slot.start == IEEE802154_CONFIG_RX_SLOT_OFF ||
+		    config->rx_slot.duration == 0) {
+			sl_802154_state_set_rx_slot_off(&data->radio_data.state, true);
+			sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+			sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
+			if (sl_802154_state_is_rx_started(&data->radio_data.state)) {
+				sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
+			}
+			return 0;
+		}
+
+		sl_802154_state_set_rx_slot_off(&data->radio_data.state, false);
+
 		sl_rail_scheduled_rx_config_t scheduled_rx_config = {
-			.start = config->rx_slot.start,
+			.start = (sl_rail_time_t)(config->rx_slot.start / NSEC_PER_USEC),
 			.start_mode = SL_RAIL_TIME_ABSOLUTE,
-			.end = config->rx_slot.duration,
+			.end = (sl_rail_time_t)(config->rx_slot.duration / NSEC_PER_USEC),
 			.end_mode = SL_RAIL_TIME_DELAY,
 			/* To stay in schedule Rx state after packet receive. */
 			.rx_transition_end_schedule = 0,
 			/* This lets us receive a packet near a window-end-event */
 			.hard_window_end = 0,
 		};
-		sl_rail_start_scheduled_rx(data->radio_data.rail_handle, data->current_channel,
-					   &scheduled_rx_config, &scheduler_info);
-		return 0;
+		/* Mirror the SISDK PAL: mark RX as scheduled before handing it to RAIL so
+		 * a near-immediate start cannot race the driver-side state bookkeeping.
+		 */
+		sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, true);
+		sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
+		status = sl_rail_start_scheduled_rx(data->radio_data.rail_handle,
+						    config->rx_slot.channel,
+						    &scheduled_rx_config,
+						    &scheduler_info);
+		if (status != SL_RAIL_STATUS_NO_ERROR) {
+			sl_802154_state_set_scheduled_rx_pending(&data->radio_data.state, false);
+		}
+		return (status == SL_RAIL_STATUS_NO_ERROR) ? 0 : -EIO;
 
 	case IEEE802154_CONFIG_CSL_PERIOD:
-		data->csl_period_us = config->csl_period;
+		if (!SL_802154_HAS_CSL_SUPPORT) {
+			return -ENOTSUP;
+		}
+
+		data->csl_period = config->csl_period;
 		return 0;
 
 	case IEEE802154_CONFIG_EXPECTED_RX_TIME:
-		data->csl_sample_time = config->expected_rx_time;
+		if (!SL_802154_HAS_CSL_SUPPORT) {
+			return -ENOTSUP;
+		}
+
+		data->csl_sample_time_us =
+			(uint32_t)(config->expected_rx_time / NSEC_PER_USEC) + SL_802154_PHR_DURATION_US;
 		return 0;
-#endif
 
 	default:
 		return -ENOTSUP;
@@ -2706,7 +2941,8 @@ static struct sl_802154_data silabs_efr32_data = {
 				.idle_to_rx = 100,
 				.tx_to_rx = 192 - 10,
 				.idle_to_tx = 100,
-				.rx_to_tx = 192,
+				.rx_to_tx = IS_ENABLED(CONFIG_OPENTHREAD_THREAD_VERSION_1_1) ?
+					192 : SL_802154_RX_TO_ENH_ACK_TX_US,
 				.rxsearch_timeout = 0,
 				.tx_to_rxsearch_timeout = 0,
 				.tx_to_tx = 0,

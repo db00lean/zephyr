@@ -147,9 +147,6 @@ configdefault OPENTHREAD_UPTIME
 configdefault OPENTHREAD_CSL_RECEIVER
 	default y
 
-configdefault OPENTHREAD_CSL_AUTO_SYNC
-	default y
-
 configdefault OPENTHREAD_CSL_RECEIVE_TIME_AHEAD
 	default 1000 if SILABS_SISDK_RAIL_MULTIPROTOCOL
 	default 600

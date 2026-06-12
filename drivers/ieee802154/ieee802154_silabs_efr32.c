@@ -1685,6 +1685,8 @@ static void sl_802154_handle_tx_completion(struct sl_802154_data *data, sl_rail_
 	k_sem_give(&data->tx_wait);
 }
 
+static void sl_802154_resume_background_rx_if_idle_enabled(struct sl_802154_data *data);
+
 /* RAIL events callback (runs in ISR). Minimal work: set TX result + give sem; schedule RX work. */
 static void sl_802154_rail_events_callback(sl_rail_handle_t handle, sl_rail_events_t events)
 {
@@ -1715,7 +1717,9 @@ static void sl_802154_rail_events_callback(sl_rail_handle_t handle, sl_rail_even
 			sl_802154_state_set_scheduled_rx_started(&data->radio_data.state, false);
 			LOG_DBG("Scheduled RX %s", (events & SL_RAIL_EVENT_RX_SCHEDULED_RX_END) ?
 				"ended" : "missed");
-			if (data->event_handler != NULL) {
+			if (data->radio_data.rx_on_when_idle) {
+				sl_802154_resume_background_rx_if_idle_enabled(data);
+			} else if (data->event_handler != NULL) {
 				data->event_handler(dev, IEEE802154_EVENT_RX_OFF, NULL);
 			} else {
 				sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
@@ -2102,9 +2106,21 @@ static void silabs_efr32_iface_init(struct net_if *iface)
 static enum ieee802154_hw_caps silabs_efr32_get_capabilities(const struct device *dev)
 {
 	ARG_UNUSED(dev);
-	return IEEE802154_HW_FCS | IEEE802154_HW_FILTER | IEEE802154_HW_TX_RX_ACK |
-	       IEEE802154_HW_ENERGY_SCAN | IEEE802154_HW_SLEEP_TO_TX | IEEE802154_HW_CSMA |
-	       IEEE802154_HW_TX_SEC | IEEE802154_HW_TXTIME | IEEE802154_HW_RXTIME;
+	enum ieee802154_hw_caps caps = IEEE802154_HW_FCS | IEEE802154_HW_FILTER |
+				       IEEE802154_HW_TX_RX_ACK |
+				       IEEE802154_HW_ENERGY_SCAN | IEEE802154_HW_SLEEP_TO_TX |
+				       IEEE802154_HW_CSMA | IEEE802154_HW_TX_SEC |
+				       IEEE802154_RX_ON_WHEN_IDLE;
+
+	if (IS_ENABLED(CONFIG_NET_PKT_TXTIME)) {
+		caps |= IEEE802154_HW_TXTIME;
+	}
+
+	if (IS_ENABLED(CONFIG_NET_PKT_TIMESTAMP) || IS_ENABLED(CONFIG_NET_PKT_TXTIME)) {
+		caps |= IEEE802154_HW_RXTIME;
+	}
+
+	return caps;
 }
 
 static int silabs_efr32_cca(const struct device *dev)
@@ -2202,6 +2218,17 @@ static int sl_802154_start_background_rx(struct sl_802154_data *data)
 	return 0;
 }
 
+static void sl_802154_resume_background_rx_if_idle_enabled(struct sl_802154_data *data)
+{
+	if (!data->radio_data.rx_on_when_idle ||
+	    !sl_802154_state_is_rx_started(&data->radio_data.state) ||
+	    sl_802154_state_is_rx_slot_off(&data->radio_data.state)) {
+		return;
+	}
+
+	(void)sl_802154_start_background_rx(data);
+}
+
 static void sl_802154_cancel_scheduled_rx(struct sl_802154_data *data)
 {
 	if (!sl_802154_state_is_rx_scheduled(&data->radio_data.state) &&
@@ -2264,8 +2291,6 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 		.slip_time = SL_802154_SCHEDULER_CHANNEL_SLIP_TIME,
 		.transaction_time = 0 /* will be calculated later if DMP is used */
 	};
-	sl_rail_scheduled_tx_config_t scheduled_tx_config;
-	sl_rail_csma_config_t csma = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA;
 	int sec_ret;
 	uint32_t sym_rate;
 	uint32_t bit_rate;
@@ -2308,6 +2333,12 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 			effective_mode, (long long)tx_time_ns, (unsigned int)data->csl_period);
 	}
 
+	if ((effective_mode == IEEE802154_TX_MODE_TXTIME ||
+	     effective_mode == IEEE802154_TX_MODE_TXTIME_CCA) && tx_time_ns == 0) {
+		LOG_ERR("timed TX requested without packet timestamp");
+		return -EINVAL;
+	}
+
 	sl_802154_cancel_scheduled_rx(data);
 	sl_802154_state_set_tx_data_ongoing(&data->radio_data.state, true);
 
@@ -2339,7 +2370,7 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 	k_sem_reset(&data->ack_wait);
 	data->tx_errno = -EIO; /* default if no event fires */
 
-	scheduled_tx_config = (sl_rail_scheduled_tx_config_t){
+	data->radio_data.scheduled_tx_config = (sl_rail_scheduled_tx_config_t){
 		.when = (sl_rail_time_t)((tx_time_ns / NSEC_PER_USEC) - SL_802154_SHR_DURATION_US),
 		.mode = SL_RAIL_TIME_ABSOLUTE,
 		.tx_during_rx = SL_RAIL_SCHEDULED_TX_DURING_RX_POSTPONE_TX,
@@ -2380,11 +2411,12 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 		if (IS_ENABLED(CONFIG_SILABS_SISDK_RAIL_MULTIPROTOCOL)) {
 			tx_scheduler_info.transaction_time += SL_802154_TIMING_CSMA_OVERHEAD_US;
 		}
-		csma.csma_tries = data->radio_data.csma_ca_backoffs;
-		csma.cca_threshold_dbm = SL_802154_CCA_THRESHOLD_DEFAULT;
+		data->radio_data.csma_config.csma_tries = data->radio_data.csma_ca_backoffs;
+		data->radio_data.csma_config.cca_threshold_dbm = SL_802154_CCA_THRESHOLD_DEFAULT;
 		status = sl_rail_start_cca_csma_tx(data->radio_data.rail_handle,
 						   (uint8_t)data->current_channel, tx_options,
-						   &csma, &tx_scheduler_info);
+						   &data->radio_data.csma_config,
+						   &tx_scheduler_info);
 		break;
 	case IEEE802154_TX_MODE_DIRECT:
 		status = sl_rail_start_tx(data->radio_data.rail_handle,
@@ -2395,18 +2427,20 @@ static int silabs_efr32_tx(const struct device *dev, enum ieee802154_tx_mode mod
 		status = sl_rail_start_scheduled_tx(data->radio_data.rail_handle,
 			data->current_channel,
 			tx_options,
-			&scheduled_tx_config,
+			&data->radio_data.scheduled_tx_config,
 			&tx_scheduler_info);
 		break;
 	case IEEE802154_TX_MODE_TXTIME_CCA:
-		csma = (sl_rail_csma_config_t)SL_RAIL_CSMA_CONFIG_SINGLE_CCA;
-		csma.cca_backoff_us = SL_802154_CSMA_BACKOFF_TIME_US;
-		scheduled_tx_config.when -= csma.cca_backoff_us;
+		data->radio_data.single_cca_config = (sl_rail_csma_config_t)SL_RAIL_CSMA_CONFIG_SINGLE_CCA;
+		data->radio_data.single_cca_config.cca_backoff_us =
+			SL_802154_CSMA_BACKOFF_TIME_US;
+		data->radio_data.scheduled_tx_config.when -=
+			data->radio_data.single_cca_config.cca_backoff_us;
 		status = sl_rail_start_scheduled_cca_csma_tx(data->radio_data.rail_handle,
 			data->current_channel,
 			tx_options,
-			&scheduled_tx_config,
-			&csma,
+			&data->radio_data.scheduled_tx_config,
+			&data->radio_data.single_cca_config,
 			&tx_scheduler_info);
 		break;
 	default:
@@ -2745,6 +2779,24 @@ static int silabs_efr32_configure(const struct device *dev, enum ieee802154_conf
 		data->radio_data.csma_ca_backoffs = config->csma_ca_backoffs;
 		return 0;
 
+	case IEEE802154_CONFIG_RX_ON_WHEN_IDLE:
+		data->radio_data.rx_on_when_idle = config->rx_on_when_idle;
+
+		if (!data->radio_data.rail_initialized) {
+			return 0;
+		}
+
+		if (!data->radio_data.rx_on_when_idle) {
+			if (!sl_802154_state_is_rx_scheduled(&data->radio_data.state) &&
+			    !sl_802154_state_is_scheduled_rx_started(&data->radio_data.state)) {
+				sl_802154_set_radio_to_idle(data->radio_data.rail_handle);
+			}
+			return 0;
+		}
+
+		sl_802154_resume_background_rx_if_idle_enabled(data);
+		return 0;
+
 	case IEEE802154_CONFIG_RX_SLOT:
 		if (!SL_802154_HAS_CSL_SUPPORT) {
 			return -ENOTSUP;
@@ -2923,6 +2975,8 @@ static int silabs_efr32_init(const struct device *dev)
 static struct sl_802154_data silabs_efr32_data = {
 	.radio_data = {
 		.state = ATOMIC_INIT(0),
+		.csma_config = SL_RAIL_CSMA_CONFIG_802_15_4_2003_2P4_GHZ_OQPSK_CSMA,
+		.single_cca_config = SL_RAIL_CSMA_CONFIG_SINGLE_CCA,
 		.rail_ieee802154_config = {
 			.p_addresses = NULL,
 			.ack_config = {

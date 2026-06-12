@@ -113,6 +113,11 @@ struct sl_802154_radio_data {
 
 	const sl_rail_ieee802154_config_t rail_ieee802154_config;
 
+	/* TX configs stored in driver-owned memory for RAIL's async use. */
+	sl_rail_csma_config_t csma_config;
+	sl_rail_csma_config_t single_cca_config;
+	sl_rail_scheduled_tx_config_t scheduled_tx_config;
+
 	/* Timer for energy scan operations */
 	sl_rail_multi_timer_t rail_timer;
 
@@ -124,6 +129,7 @@ struct sl_802154_radio_data {
 	uint8_t csma_ca_backoffs;
 
 	bool rail_initialized;
+	bool rx_on_when_idle;
 };
 
 /* Short and extended addresses used for software frame-pending (FPB).

@@ -66,7 +66,7 @@ static void top_callback(sl_rail_multi_timer_t *handle, sl_rail_time_t expected_
 	struct counter_silabs_data *dev_data = (struct counter_silabs_data *)(top_data->dev)->data;
 
 	if (top_data->callback != NULL) {
-		top_data->callback(top_data->dev, top_data->user_data);
+		top_data->callback(top_data->dev, (void *)top_data->user_data);
 		/* Re-arm overflow at next occurrence of max value (absolute UINT32_MAX) */
 		sl_rail_set_multi_timer(SL_RAIL_EFR32_HANDLE, &dev_data->top_timer,
 					RAIL_TIMER_TOP_VALUE, SL_RAIL_TIME_ABSOLUTE,
